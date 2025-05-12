@@ -20,10 +20,15 @@ class Chat(BaseTeamModel, TaggedModelMixin, UserCommentsMixin):
     class MetadataKeys(StrEnum):
         OPENAI_THREAD_ID = "openai_thread_id"
         EXPERIMENT_VERSION = "experiment_version"
+        EMBED_SOURCE = "embed_source"
 
     # must match or be greater than experiment name field
     name = models.CharField(max_length=128, default="Unnamed Chat")
     metadata = models.JSONField(default=dict)
+
+    @property
+    def embed_source(self):
+        return self.metadata.get(Chat.MetadataKeys.EMBED_SOURCE)
 
     def get_metadata(self, key: MetadataKeys):
         return self.metadata.get(key, None)
@@ -124,8 +129,16 @@ class ChatMessage(BaseModel, TaggedModelMixin, UserCommentsMixin):
         super().save(*args, **kwargs)
 
     @property
-    def trace_info(self):
-        return self.metadata.get("trace_info")
+    def trace_info(self) -> list[dict]:
+        trace_info = self.metadata.get("trace_info")
+        if not trace_info:
+            return []
+
+        if isinstance(trace_info, dict):
+            # migrate legacy format
+            trace_info["trace_provider"] = self.metadata.get("trace_provider")
+            return [trace_info]
+        return trace_info
 
     def get_summary_message(self):
         if not self.summary:

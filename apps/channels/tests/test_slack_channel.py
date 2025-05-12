@@ -6,6 +6,8 @@ from mock.mock import patch
 from apps.channels.datamodels import SlackMessage
 from apps.channels.models import ChannelPlatform, ExperimentChannel
 from apps.chat.channels import SlackChannel
+from apps.chat.models import ChatMessage, ChatMessageType
+from apps.service_providers.tracing import TraceInfo
 from apps.slack.utils import make_session_external_id
 from apps.utils.factories.channels import ExperimentChannelFactory
 
@@ -13,7 +15,7 @@ from apps.utils.factories.channels import ExperimentChannelFactory
 @pytest.mark.django_db()
 @patch("apps.chat.bots.TopicBot.process_input")
 def test_handle_user_message(process_input, slack_channel):
-    process_input.return_value = "Hi"
+    process_input.return_value = ChatMessage(content="Hi", message_type=ChatMessageType.AI)
     session = SlackChannel.start_new_session(
         slack_channel.experiment,
         slack_channel,
@@ -29,7 +31,7 @@ def test_handle_user_message(process_input, slack_channel):
     response = SlackChannel(
         slack_channel.experiment, slack_channel, session, send_response_to_user=False
     ).new_user_message(message)
-    assert response == "Hi"
+    assert response.content == "Hi"
 
 
 @pytest.mark.django_db()
@@ -43,7 +45,7 @@ def test_ad_hoc_bot_message(messaging_service, get_user_message, slack_channel):
         "SLACK_USER_ID",
         session_external_id=make_session_external_id("channel_id", "thread_ts"),
     )
-    session.ad_hoc_bot_message("Hello")
+    session.ad_hoc_bot_message("Hello", TraceInfo(name="slack test"))
     assert messaging_service.send_text_message.call_args_list == [
         mock.call("Hi", from_="", to="channel_id", thread_ts="thread_ts", platform=ChannelPlatform.SLACK)
     ]

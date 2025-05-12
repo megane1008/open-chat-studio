@@ -19,6 +19,7 @@ from apps.service_providers.llm_service.runnables import (
     LLMChat,
     SimpleLLMChat,
 )
+from apps.service_providers.tracing import TracingService
 from apps.utils.factories.channels import ChannelPlatform, ExperimentChannelFactory
 from apps.utils.factories.experiment import ExperimentSessionFactory
 from apps.utils.langchain import build_fake_llm_service
@@ -38,6 +39,7 @@ def session(fake_llm_service):
     session.experiment.tools = [AgentTools.MOVE_SCHEDULED_MESSAGE_DATE]
     proxy_mock = mock.Mock()
     proxy_mock.get.return_value = {"name": "Tester"}
+    proxy_mock.get_schedules.return_value = []
     with patch("apps.service_providers.llm_service.prompt_context.ParticipantDataProxy", return_value=proxy_mock):
         yield session
 
@@ -73,6 +75,7 @@ def _get_history_manager(session, experiment=None):
     return ExperimentHistoryManager.for_llm_chat(
         session=session,
         experiment=experiment if experiment else session.experiment,
+        trace_service=TracingService.empty(),
     )
 
 
@@ -269,20 +272,19 @@ def test_runnable_with_history(runnable, session, chat, fake_llm_service):
 
 @pytest.mark.django_db()
 @pytest.mark.parametrize(
-    ("participant_with_user", "is_web_session", "considered_authorized"),
-    [(True, True, True), (False, True, False), (True, False, True), (False, False, True)],
+    ("participant_with_user", "is_web_session"),
+    [(True, True), (False, True), (True, False), (False, False)],
 )
 @patch("apps.channels.forms.TelegramChannelForm._set_telegram_webhook")
 def test_runnable_with_participant_data(
     _set_telegram_webhook,
     participant_with_user,
     is_web_session,
-    considered_authorized,
     runnable,
     session,
     fake_llm_service,
 ):
-    """Participant data should be included in the prompt only for authorized users"""
+    """Participant data should be included in the prompt"""
     session.experiment_channel = ExperimentChannelFactory(
         experiment=session.experiment, platform=ChannelPlatform.WEB if is_web_session else ChannelPlatform.TELEGRAM
     )
@@ -303,10 +305,7 @@ def test_runnable_with_participant_data(
     )
     chain.invoke("hi")
 
-    if considered_authorized:
-        expected_prompt = "System prompt. Participant data: {'name': 'Tester'}"
-    else:
-        expected_prompt = "System prompt. Participant data: "
+    expected_prompt = "System prompt. Participant data: {'name': 'Tester'}"
     assert fake_llm_service.llm.get_call_messages()[0][0] == SystemMessage(content=expected_prompt)
 
 

@@ -23,9 +23,9 @@ logger = logging.getLogger("ocs.experiments")
 
 
 @shared_task(bind=True, base=TaskbadgerTask)
-def async_export_chat(self, experiment_id: int, query_params: dict, include_api: bool) -> dict:
+def async_export_chat(self, experiment_id: int, query_params: dict) -> dict:
     experiment = Experiment.objects.get(id=experiment_id)
-    filtered_sessions = get_filtered_sessions(self.request, experiment, query_params, include_api)
+    filtered_sessions = get_filtered_sessions(self.request, experiment, query_params)
     csv_in_memory = filtered_export_to_csv(experiment, filtered_sessions)
     filename = f"{experiment.name} Chat Export {timezone.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
     file_obj = File.objects.create(
@@ -74,9 +74,9 @@ def get_response_for_webchat_task(
             attachments=message_attachments,
         )
         update_taskbadger_data(self, web_channel, message)
-        with current_team(experiment_session.team):
-            response["response"] = web_channel.new_user_message(message)
-            response["message_id"] = web_channel.bot.get_ai_message_id()
+        chat_message = web_channel.new_user_message(message)
+        response["response"] = chat_message.content
+        response["message_id"] = chat_message.id
     except Exception as e:
         logger.exception(e)
         response["error"] = str(e)

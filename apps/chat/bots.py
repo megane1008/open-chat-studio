@@ -7,9 +7,9 @@ from langchain_core.runnables import chain
 from pydantic import ValidationError
 
 from apps.annotations.models import TagCategories
-from apps.chat.conversation import BasicConversation, Conversation
+from apps.chat.conversation import BasicConversation
 from apps.chat.exceptions import ChatException
-from apps.chat.models import ChatMessageType
+from apps.chat.models import ChatMessage, ChatMessageType
 from apps.events.models import StaticTriggerType
 from apps.events.tasks import enqueue_static_triggers
 from apps.experiments.models import Experiment, ExperimentRoute, ExperimentSession, SafetyLayer
@@ -17,6 +17,7 @@ from apps.pipelines.nodes.base import PipelineState
 from apps.service_providers.llm_service.default_models import get_default_model
 from apps.service_providers.llm_service.prompt_context import PromptTemplateContext
 from apps.service_providers.llm_service.runnables import create_experiment_runnable
+from apps.service_providers.tracing import TraceInfo, TracingService
 
 if TYPE_CHECKING:
     from apps.channels.datamodels import Attachment
@@ -26,7 +27,7 @@ def create_conversation(
     prompt_str: str,
     source_material: str,
     llm: BaseChatModel,
-) -> Conversation:
+) -> BasicConversation:
     try:
         return BasicConversation(
             prompt_str=prompt_str,
@@ -44,11 +45,11 @@ def notify_users_of_violation(session_id: int, safety_layer_id: int):
     notify_users_of_safety_violations_task.delay(session_id, safety_layer_id)
 
 
-def get_bot(session: ExperimentSession, experiment: Experiment | None = None, disable_tools: bool = False):
+def get_bot(session: ExperimentSession, experiment: Experiment, trace_service, disable_tools: bool = False):
     experiment = experiment or session.experiment_version
     if experiment.pipeline_id:
-        return PipelineBot(session, experiment=experiment, disable_reminder_tools=disable_tools)
-    return TopicBot(session, experiment, disable_tools=disable_tools)
+        return PipelineBot(session, experiment, trace_service, disable_reminder_tools=disable_tools)
+    return TopicBot(session, experiment, trace_service, disable_tools=disable_tools)
 
 
 class TopicBot:
@@ -65,8 +66,8 @@ class TopicBot:
         conversation history of the participant's chat with the router / main bot.
     """
 
-    def __init__(self, session: ExperimentSession, experiment: Experiment | None = None, disable_tools: bool = False):
-        self.experiment = experiment or session.experiment_version
+    def __init__(self, session: ExperimentSession, experiment: Experiment, trace_service, disable_tools: bool = False):
+        self.experiment = experiment
         self.disable_tools = disable_tools
         self.prompt = self.experiment.prompt_text
         self.input_formatter = self.experiment.input_formatter
@@ -88,7 +89,7 @@ class TopicBot:
         self.default_tag = None
         self.terminal_chain = None
         self.processor_experiment = None
-        self.trace_service = self.experiment.trace_service
+        self.trace_service = trace_service
 
         # The chain that generated the AI message
         self.generator_chain = None
@@ -97,7 +98,7 @@ class TopicBot:
     def _initialize(self):
         for child_route in self.child_experiment_routes:
             child_runnable = create_experiment_runnable(
-                child_route.child, self.session, self.disable_tools, trace_service=self.trace_service
+                child_route.child, self.session, self.trace_service, self.disable_tools
             )
             self.child_chains[child_route.keyword.lower().strip()] = child_runnable
             if child_route.is_default:
@@ -107,16 +108,14 @@ class TopicBot:
         if self.child_chains and not self.default_child_chain:
             self.default_tag, self.default_child_chain = list(self.child_chains.items())[0]
 
-        self.chain = create_experiment_runnable(
-            self.experiment, self.session, self.disable_tools, trace_service=self.trace_service
-        )
+        self.chain = create_experiment_runnable(self.experiment, self.session, self.trace_service, self.disable_tools)
 
         terminal_route = (
             ExperimentRoute.objects.select_related("child").filter(parent=self.experiment, type="terminal").first()
         )
         if terminal_route:
             self.terminal_chain = create_experiment_runnable(
-                terminal_route.child, self.session, trace_service=self.trace_service
+                terminal_route.child, self.session, self.trace_service, self.disable_tools
             )
 
         # load up the safety bots. They should not be agents. We don't want them using tools (for now)
@@ -207,34 +206,10 @@ class TopicBot:
                     enqueue_static_triggers.delay(self.session.id, StaticTriggerType.BOT_SAFETY_LAYER_TRIGGERED)
                     return self._get_safe_response(safety_bot.safety_layer)
 
-            return response
+            return self.generator_chain.history_manager.ai_message
 
-        config = {}
-        if self.trace_service:
-            callback = self.trace_service.get_callback(
-                trace_name=self.experiment.name,
-                participant_id=str(self.session.participant.identifier),
-                session_id=str(self.session.external_id),
-            )
-            config = {
-                "run_name": self.experiment.name,
-                "callbacks": [callback],
-                "metadata": {
-                    "participant-id": str(self.session.participant.identifier),
-                    "session-id": str(self.session.external_id),
-                },
-            }
-
-        try:
-            return main_bot_chain.invoke(user_input, config=config)
-        finally:
-            if self.trace_service:
-                self.trace_service.end()
-
-    def get_ai_message_id(self) -> int | None:
-        """Returns the generated AI message's ID. The caller can use this to fetch more information on this message"""
-        if self.generator_chain and self.generator_chain.history_manager.ai_message:
-            return self.generator_chain.history_manager.ai_message.id
+        config = self.trace_service.get_langchain_config()
+        return main_bot_chain.invoke(user_input, config=config)
 
     def _get_safe_response(self, safety_layer: SafetyLayer):
         if safety_layer.prompt_to_bot:
@@ -251,10 +226,10 @@ class TopicBot:
             self.generator_chain.history_manager.ai_message.add_system_tag(
                 safety_layer.name, tag_category=TagCategories.SAFETY_LAYER_RESPONSE
             )
-        return bot_response
+        return self.generator_chain.history_manager.ai_message
 
-    def _save_message_to_history(self, message: str, message_type: ChatMessageType):
-        self.chain.history_manager.save_message_to_history(message, type_=message_type)
+    def _save_message_to_history(self, message: str, message_type: ChatMessageType) -> ChatMessage:
+        return self.chain.history_manager.save_message_to_history(message, type_=message_type)
 
 
 class SafetyBot:
@@ -293,16 +268,18 @@ class SafetyBot:
 
 
 class PipelineBot:
-    def __init__(self, session: ExperimentSession, experiment: Experiment, disable_reminder_tools=False):
+    def __init__(self, session: ExperimentSession, experiment: Experiment, trace_service, disable_reminder_tools=False):
         self.experiment = experiment
         self.session = session
-        self.ai_message_id = None
+        self.trace_service = trace_service
         self.disable_reminder_tools = disable_reminder_tools
 
-    def process_input(self, user_input: str, save_input_to_history=True, attachments: list["Attachment"] | None = None):
+    def process_input(
+        self, user_input: str, save_input_to_history=True, attachments: list["Attachment"] | None = None
+    ) -> ChatMessage:
         attachments = attachments or []
         serializable_attachments = [attachment.model_dump() for attachment in attachments]
-        output: PipelineState = self.experiment.pipeline.invoke(
+        return self.experiment.pipeline.invoke(
             PipelineState(
                 messages=[user_input],
                 experiment_session=self.session,
@@ -310,44 +287,47 @@ class PipelineBot:
                 pipeline_version=self.experiment.pipeline.version_number,
             ),
             self.session,
+            self.experiment,
+            self.trace_service,
             save_input_to_history=save_input_to_history,
             disable_reminder_tools=self.disable_reminder_tools,
         )
-        self.ai_message_id = output["ai_message_id"]
-        return output["messages"][-1]
-
-    def get_ai_message_id(self) -> int:
-        return self.ai_message_id
 
 
 class EventBot:
     SYSTEM_PROMPT = textwrap.dedent(
         """
-    Your role is to generate messages to send to users. These could be reminders
-    or prompts to help them complete their tasks. The text that you generate will be sent
-    to the user in a chat message.
-
-    You should generate the message in the language of the user.
-
-    This is the data we have about the user:
-    ```
-    {participant_data}
-    ```
-
-    The current date and time is: {current_datetime}
+        Your role is to generate messages to send to users. These could be reminders
+        or prompts to help them complete their tasks. The text that you generate will be sent
+        to the user in a chat message.
     
-    Here are the most recent messages in the conversation:
-    ```
-    {conversation_history}
-    ```
-    """
+        You should generate the message in same language as the recent conversation history shown below.
+        If there is no history use English.
+
+        #### Conversation history
+        {conversation_history}
+    
+        #### User data
+        {participant_data}
+    
+        #### Current date and time
+        {current_datetime}
+        """
     )
 
-    def __init__(self, session: ExperimentSession, experiment: Experiment):
+    def __init__(
+        self,
+        session: ExperimentSession,
+        experiment: Experiment,
+        trace_info: TraceInfo,
+        history_manager=None,
+    ):
         self.session = session
         self.experiment = experiment or session.experiment_version
+        self.history_manager = history_manager
+        self.trace_info = trace_info
 
-    def get_user_message(self, event_prompt: str):
+    def get_user_message(self, event_prompt: str) -> str:
         provider = self.llm_provider
         if not provider:
             raise Exception("No LLM provider found")
@@ -356,13 +336,33 @@ class EventBot:
 
         service = provider.get_llm_service()
         llm = service.get_chat_model(model.name, 0.7)
-        response = llm.invoke(
-            [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": f"Generate the message for the user based on this text: {event_prompt}"},
-            ]
-        )
-        return response.content
+
+        if self.history_manager:
+            trace_service = self.history_manager.trace_service
+        else:
+            trace_service = TracingService.create_for_experiment(self.experiment)
+
+        with trace_service.trace_or_span(
+            name=f"{self.experiment.name} - {self.trace_info.name}",
+            session_id=str(self.session.external_id),
+            user_id=str(self.session.participant.identifier),
+            inputs={"input": event_prompt},
+            metadata=self.trace_info.metadata,
+        ):
+            config = trace_service.get_langchain_config()
+            response = llm.invoke(
+                [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": event_prompt},
+                ],
+                config=config,
+            )
+            trace_service.set_current_span_outputs({"response": response.content})
+
+            message = response.content
+            if self.history_manager:
+                self.history_manager.save_message_to_history(message, type_=ChatMessageType.AI)
+        return message
 
     @property
     def llm_provider(self):
@@ -384,4 +384,14 @@ class EventBot:
             messages.append(f"{message.role}: {message.content}")
             if len(messages) > 10:
                 break
-        return "\n".join(reversed(messages))
+        if messages:
+            return textwrap.dedent(
+                """
+                Here are the most recent messages in the conversation:
+                ```
+                {}
+                ```
+                """
+            ).format("\n".join(reversed(messages)))
+        else:
+            return "\nThis is the start of the conversation so there is no previous message history"

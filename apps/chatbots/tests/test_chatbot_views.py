@@ -75,7 +75,7 @@ def test_create_chatbot_view(team_with_users):
     assert Experiment.objects.filter(name="My Chatbot", team=team).exists()
     experiment = Experiment.objects.get(name="My Chatbot")
     assert experiment.pipeline is not None
-    expected_url = reverse("chatbots:edit", args=[team.slug, experiment.pipeline.id])
+    expected_url = reverse("chatbots:edit", args=[team.slug, experiment.id])
     assert response.status_code == 302
     assert response.url == expected_url
 
@@ -119,7 +119,7 @@ def test_get_success_url(team_with_users):
 
     success_url = view.get_success_url()
     url = "chatbots:single_chatbot_home"
-    expected_url = f"{reverse(url,kwargs={'team_slug': team.slug, 'experiment_id': experiment.id})}#versions"
+    expected_url = f"{reverse(url, kwargs={'team_slug': team.slug, 'experiment_id': experiment.id})}#versions"
     assert success_url == expected_url
 
 
@@ -152,7 +152,7 @@ def attach_middleware_to_request(request):
     session_middleware = SessionMiddleware(lambda req: None)
     session_middleware.process_request(request)
     request.session.save()
-    setattr(request, "_messages", FallbackStorage(request))
+    request._messages = FallbackStorage(request)
 
 
 @pytest.mark.django_db()

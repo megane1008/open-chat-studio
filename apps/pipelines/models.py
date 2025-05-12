@@ -1,30 +1,47 @@
+import logging
 from collections import defaultdict
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
 from uuid import uuid4
 
 import pydantic
+from django.core.exceptions import ObjectDoesNotExist
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models, transaction
 from django.urls import reverse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_core.runnables import RunnableConfig
 from pydantic import ConfigDict
 
+from apps.annotations.models import TagCategories
 from apps.chat.models import ChatMessage, ChatMessageType
 from apps.custom_actions.form_utils import set_custom_actions
 from apps.custom_actions.mixins import CustomActionOperationMixin
-from apps.experiments.models import ExperimentSession, VersionsMixin, VersionsObjectManagerMixin
-from apps.experiments.versioning import VersionDetails, VersionField
+from apps.experiments.models import Experiment, ExperimentSession, SourceMaterial
+from apps.experiments.versioning import VersionDetails, VersionField, VersionsMixin, VersionsObjectManagerMixin
 from apps.pipelines.exceptions import PipelineBuildError
 from apps.pipelines.executor import patch_executor
 from apps.pipelines.flow import Flow, FlowNode, FlowNodeData
+from apps.pipelines.helper import duplicate_pipeline_with_new_ids
 from apps.pipelines.logging import PipelineLoggingCallbackHandler
 from apps.pipelines.nodes.base import PipelineState
 from apps.pipelines.nodes.helpers import temporary_session
 from apps.teams.models import BaseTeamModel
 from apps.utils.models import BaseModel
+
+versioning_logger = logging.getLogger("ocs.versioning")
+
+
+@dataclass
+class ModelParamSpec:
+    """A helper class to hold the parameter name and model of those that are database records"""
+
+    param_name: str
+    model_cls: VersionsMixin
+
+    def get_object(self, id: int):
+        return self.model_cls.objects.get(id=id)
 
 
 class PipelineManager(VersionsObjectManagerMixin, models.Manager):
@@ -84,11 +101,11 @@ class Pipeline(BaseTeamModel, VersionsMixin):
         return f"v{self.version_number}"
 
     @classmethod
-    def create_pipeline_with_name(cls, team, name):
-        return cls.create_default(team, name)
+    def create_default_pipeline_with_name(cls, team, name, llm_provider_id=None, llm_provider_model=None):
+        return cls.create_default(team, name, llm_provider_id, llm_provider_model)
 
     @classmethod
-    def create_default(cls, team, name=None):
+    def create_default(cls, team, name=None, llm_provider_id=None, llm_provider_model=None):
         from apps.pipelines.nodes.nodes import EndNode, StartNode
 
         default_name = "New Pipeline" if name is None else name
@@ -111,10 +128,60 @@ class Pipeline(BaseTeamModel, VersionsMixin):
             position={"x": 1000, "y": 200},
             data=FlowNodeData(id=end_id, type=EndNode.__name__, params={"name": "end"}),
         )
-        default_nodes = [start_node.model_dump(), end_node.model_dump()]
+        if llm_provider_id and llm_provider_model:
+            llm_id = f"LLMResponseWithPrompt-{uuid4().hex[:5]}"
+            llm_node = FlowNode(
+                id=llm_id,
+                type="pipelineNode",
+                position={"x": 300, "y": 0},
+                data=FlowNodeData(
+                    id=llm_id,
+                    type="LLMResponseWithPrompt",
+                    label="LLM",
+                    params={
+                        "name": llm_id,
+                        "llm_provider_id": llm_provider_id,
+                        "llm_provider_model_id": llm_provider_model.id,
+                        "llm_temperature": 0.7,
+                        "history_type": "none",
+                        "history_name": None,
+                        "history_mode": "summarize",
+                        "user_max_token_limit": llm_provider_model.max_token_limit,
+                        "max_history_length": 10,
+                        "source_material_id": None,
+                        "prompt": "You are a helpful assistant. Answer the user's query as best you can.",
+                        "tools": None,
+                        "custom_actions": None,
+                        "keywords": [""],
+                    },
+                ),
+            )
+            edges = [
+                {
+                    "id": f"edge-{start_id}-{llm_id}",
+                    "source": start_id,
+                    "target": llm_id,
+                    "sourceHandle": "output",
+                    "targetHandle": "input",
+                },
+                {
+                    "id": f"edge-{llm_id}-{end_id}",
+                    "source": llm_id,
+                    "target": end_id,
+                    "sourceHandle": "output",
+                    "targetHandle": "input",
+                },
+            ]
+        else:
+            llm_node = None
+            edges = []
+        default_nodes = [start_node.model_dump()]
+        if llm_node:
+            default_nodes.append(llm_node.model_dump())
+        default_nodes.append(end_node.model_dump())
         new_pipeline = cls.objects.create(
             team=team,
-            data={"nodes": default_nodes, "edges": []},
+            data={"nodes": default_nodes, "edges": edges},
             name=default_name if name else f"New Pipeline {existing_pipeline_count + 1}",
         )
         new_pipeline.update_nodes_from_data()
@@ -174,7 +241,7 @@ class Pipeline(BaseTeamModel, VersionsMixin):
         for node in nodes:
             name_to_flow_id[node.params.get("name")].append(node.flow_id)
 
-        for name, flow_ids in name_to_flow_id.items():
+        for _name, flow_ids in name_to_flow_id.items():
             if len(flow_ids) > 1:
                 for flow_id in flow_ids:
                     errors[flow_id].update({"name": "All node names must be unique"})
@@ -233,38 +300,28 @@ class Pipeline(BaseTeamModel, VersionsMixin):
         self,
         input: PipelineState,
         session: ExperimentSession,
+        experiment: Experiment,
+        trace_service,
         save_run_to_history=True,
         save_input_to_history=True,
         disable_reminder_tools=False,
-    ) -> dict:
+    ) -> ChatMessage:
         from apps.experiments.models import AgentTools
         from apps.pipelines.graph import PipelineGraph
 
         runnable = PipelineGraph.build_runnable_from_pipeline(self)
         pipeline_run = self._create_pipeline_run(input, session)
         logging_callback = PipelineLoggingCallbackHandler(pipeline_run)
-
         logging_callback.logger.debug("Starting pipeline run", input=input["messages"][-1])
         try:
-            callbacks = [logging_callback]
-            trace_service = session.experiment.trace_service
-            if trace_service:
-                trace_service_callback = trace_service.get_callback(
-                    trace_name=session.experiment.name,
-                    participant_id=str(session.participant.identifier),
-                    session_id=str(session.external_id),
-                )
-                callbacks.append(trace_service_callback)
-
-            config = RunnableConfig(
-                run_name=session.experiment.name,
-                callbacks=callbacks,
+            config = trace_service.get_langchain_config(
+                callbacks=[logging_callback],
                 configurable={
                     "disabled_tools": AgentTools.reminder_tools() if disable_reminder_tools else [],
                 },
             )
-            output = runnable.invoke(input, config=config)
-            output = PipelineState(**output).json_safe()
+            raw_output = runnable.invoke(input, config=config)
+            output = PipelineState(**raw_output).json_safe()
             pipeline_run.output = output
             if save_run_to_history and session is not None:
                 input_metadata = output.get("input_message_metadata", {})
@@ -279,19 +336,25 @@ class Pipeline(BaseTeamModel, VersionsMixin):
                         session, input["messages"][-1], ChatMessageType.HUMAN, metadata=input_metadata
                     )
                 ai_message = self._save_message_to_history(
-                    session, output["messages"][-1], ChatMessageType.AI, metadata=output_metadata
+                    session,
+                    output["messages"][-1],
+                    ChatMessageType.AI,
+                    metadata=output_metadata,
+                    tags=output.get("output_message_tags"),
                 )
-                output["ai_message_id"] = ai_message.id
+                ai_message.add_version_tag(
+                    version_number=experiment.version_number, is_a_version=experiment.is_a_version
+                )
+                return ai_message
+            else:
+                return ChatMessage(content=output)
         finally:
-            if trace_service:
-                trace_service.end()
             if pipeline_run.status == PipelineRunStatus.ERROR:
                 logging_callback.logger.debug("Pipeline run failed", input=input["messages"][-1])
             else:
                 pipeline_run.status = PipelineRunStatus.SUCCESS
                 logging_callback.logger.debug("Pipeline run finished", output=output["messages"][-1])
             pipeline_run.save()
-        return output
 
     def _create_pipeline_run(self, input: PipelineState, session: ExperimentSession) -> "PipelineRun":
         # Django doesn't auto-serialize objects for JSON fields, so we need to copy the input and save the ID of
@@ -306,28 +369,32 @@ class Pipeline(BaseTeamModel, VersionsMixin):
         )
 
     def _save_message_to_history(
-        self, session: ExperimentSession, message: str, type_: ChatMessageType, metadata: dict
+        self, session: ExperimentSession, message: str, type_: ChatMessageType, metadata: dict, tags: list[str] = None
     ) -> ChatMessage:
         chat_message = ChatMessage.objects.create(
             chat=session.chat, message_type=type_.value, content=message, metadata=metadata
         )
 
-        if type_ == ChatMessageType.AI:
-            chat_message.add_version_tag(version_number=self.version_number, is_a_version=self.is_a_version)
+        if tags:
+            for tag in tags:
+                chat_message.add_system_tag(tag, TagCategories.BOT_RESPONSE)
         return chat_message
 
     @transaction.atomic()
-    def create_new_version(self, *args, **kwargs):
-        version_number = self.version_number
-        self.version_number = version_number + 1
-        self.save(update_fields=["version_number"])
-
-        pipeline_version = super().create_new_version(save=False, *args, **kwargs)
+    def create_new_version(self, is_copy: bool = False):
+        version_number = 1 if is_copy else self.version_number
+        if not is_copy:
+            self.version_number = self.version_number + 1
+            self.save(update_fields=["version_number"])
+        pipeline_version = super().create_new_version(save=False, is_copy=is_copy)
         pipeline_version.version_number = version_number
+        id_mapping = {}
+        if is_copy:
+            data, id_mapping = duplicate_pipeline_with_new_ids(self.data)
+            pipeline_version.data = data
         pipeline_version.save()
-
         for node in self.node_set.all():
-            node_version = node.create_new_version()
+            node_version = node.create_new_version(is_copy=is_copy, new_flow_id=id_mapping.get(node.flow_id))
             node_version.pipeline = pipeline_version
             node_version.save(update_fields=["pipeline"])
 
@@ -416,27 +483,50 @@ class Node(BaseModel, VersionsMixin, CustomActionOperationMixin):
     def __str__(self):
         return self.flow_id
 
-    def create_new_version(self):
+    def create_new_version(self, is_copy=False, new_flow_id=None):
         """
         Create a new version of the node and if the node is an assistant node, create a new version of the assistant
         and update the `assistant_id` in the node params to the new assistant version id.
         """
         from apps.assistants.models import OpenAiAssistant
-        from apps.pipelines.nodes.nodes import AssistantNode
+        from apps.documents.models import Collection
+        from apps.pipelines.nodes.nodes import AssistantNode, LLMResponseWithPrompt
 
-        assistant_node_name = AssistantNode.__name__
+        new_version = super().create_new_version(save=False, is_copy=is_copy)
+        if is_copy and new_flow_id:
+            old_flow_id = new_version.flow_id
+            new_version.flow_id = new_flow_id
+            if new_version.type not in ("StartNode", "EndNode") and new_version.params["name"] == old_flow_id:
+                new_version.params["name"] = new_flow_id
 
-        new_version = super().create_new_version(save=False)
-
-        if self.type == assistant_node_name and new_version.params.get("assistant_id"):
+        if not is_copy and self.type == AssistantNode.__name__ and new_version.params.get("assistant_id"):
             assistant = OpenAiAssistant.objects.get(id=new_version.params.get("assistant_id"))
             if not assistant.is_a_version:
                 assistant_version = assistant.create_new_version()
                 # convert to string to be consistent with values from the UI
                 new_version.params["assistant_id"] = str(assistant_version.id)
 
+        if not is_copy and self.type == LLMResponseWithPrompt.__name__:
+            if collection_id := new_version.params.get("collection_id"):
+                collection = Collection.objects.get(id=collection_id)
+
+                if not collection.has_versions or collection.compare_with_latest():
+                    collection_version = collection.create_new_version()
+                    new_version.params["collection_id"] = str(collection_version.id)
+                else:
+                    new_version.params["collection_id"] = self.latest_version.params.get("collection_id")
+
+            if source_material_id := new_version.params.get("source_material_id"):
+                source_material = SourceMaterial.objects.filter(id=source_material_id).first()
+                if not source_material:
+                    new_version.params["source_material_id"] = None
+                else:
+                    if not source_material.has_versions or source_material.compare_with_latest():
+                        source_material = source_material.create_new_version()
+                        new_version.params["source_material_id"] = str(source_material.id)
+
         new_version.save()
-        self._copy_custom_action_operations_to_new_version(new_node=new_version)
+        self._copy_custom_action_operations_to_new_version(new_node=new_version, is_copy=is_copy)
 
         return new_version
 
@@ -457,19 +547,18 @@ class Node(BaseModel, VersionsMixin, CustomActionOperationMixin):
         Archiving a node will also archive the assistant if it is an assistant node. The node's versions will be
         archived when the pipeline they belong to is archived.
         """
-        from apps.assistants.models import OpenAiAssistant
-
         super().archive()
-        if self.is_a_version and self.type == "AssistantNode":
-            assistant_id = self.params.get("assistant_id")
-            if assistant_id:
-                assistant = OpenAiAssistant.objects.get(id=assistant_id)
-                assistant.archive()
+        if not self.is_a_version:
+            return
+
+        self._archive_related_params()
 
     @property
     def version_details(self) -> VersionDetails:
         from apps.assistants.models import OpenAiAssistant
+        from apps.documents.models import Collection
         from apps.experiments.models import VersionFieldDisplayFormatters
+        from apps.pipelines.nodes.nodes import LLMResponseWithPrompt
 
         node_name = self.params.get("name", self.type)
         if node_name == self.flow_id:
@@ -482,16 +571,36 @@ class Node(BaseModel, VersionsMixin, CustomActionOperationMixin):
                 case "tools":
                     display_formatter = VersionFieldDisplayFormatters.format_tools
                 case "custom_actions":
-                    display_formatter = VersionFieldDisplayFormatters.format_custom_action_operation
+                    # This is appended to the param_versions list separately
+                    continue
                 case "name":
                     value = node_name
                 case "assistant_id":
                     name = "assistant"
                     # Load the assistant, since it is being versioned
-                    value = OpenAiAssistant.objects.filter(id=value).first()
+                    if value:
+                        value = OpenAiAssistant.objects.filter(id=value).first()
+                case "collection_id":
+                    name = "media"
+                    if value:
+                        value = Collection.objects.filter(id=value).first()
+                case "source_material_id":
+                    name = "source_material"
+                    if value:
+                        value = SourceMaterial.objects.filter(id=value).first()
 
             param_versions.append(
-                VersionField(group_name=node_name, name=name, raw_value=value, to_display=display_formatter)
+                VersionField(group_name=node_name, name=name, raw_value=value, to_display=display_formatter),
+            )
+
+        if self.type == LLMResponseWithPrompt.__name__:
+            param_versions.append(
+                VersionField(
+                    group_name=node_name,
+                    name="custom_actions",
+                    queryset=self.get_custom_action_operations(),
+                    to_display=VersionFieldDisplayFormatters.format_custom_action_operation,
+                )
             )
 
         return VersionDetails(
@@ -502,6 +611,32 @@ class Node(BaseModel, VersionsMixin, CustomActionOperationMixin):
     def requires_attachment_tool(self) -> bool:
         """When a collection is linked, the attachment tool is required"""
         return self.params.get("collection_id") is not None
+
+    def _archive_related_params(self):
+        """
+        Archive related params that were also versioned along with this node
+        """
+        from apps.assistants.models import OpenAiAssistant
+        from apps.documents.models import Collection
+        from apps.pipelines.nodes import nodes
+
+        model_param_specs = {
+            nodes.AssistantNode.__name__: [ModelParamSpec(param_name="assistant_id", model_cls=OpenAiAssistant)],
+            nodes.LLMResponseWithPrompt.__name__: [
+                ModelParamSpec(param_name="collection_id", model_cls=Collection)
+                # TODO: Custom actions needed
+            ],
+        }
+
+        for spec in model_param_specs.get(self.type, []):
+            if instance_id := self.params[spec.param_name]:
+                try:
+                    obj = spec.get_object(instance_id)
+                    obj.archive()
+                except ObjectDoesNotExist:
+                    versioning_logger.exception(
+                        f"Failed to archive {spec.param_name} with id {instance_id}, since it could not be found"
+                    )
 
 
 class PipelineRunStatus(models.TextChoices):

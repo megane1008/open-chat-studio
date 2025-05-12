@@ -8,26 +8,21 @@ from typing import Self
 from uuid import uuid4
 
 import markdown
-import pytz
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
-from django.core.exceptions import FieldDoesNotExist, ValidationError
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, validate_email
 from django.db import models, transaction
 from django.db.models import (
     BooleanField,
     Case,
-    CharField,
     Count,
-    F,
     OuterRef,
     Q,
     Subquery,
     UniqueConstraint,
-    Value,
     When,
 )
-from django.db.models.functions import Cast, Concat
 from django.template.loader import get_template
 from django.urls import reverse
 from django.utils import timezone
@@ -40,9 +35,11 @@ from apps.annotations.models import Tag
 from apps.chat.models import Chat, ChatMessage, ChatMessageType
 from apps.custom_actions.mixins import CustomActionOperationMixin
 from apps.experiments import model_audit_fields
-from apps.experiments.versioning import VersionDetails, VersionField, differs
+from apps.experiments.versioning import VersionDetails, VersionField, VersionsMixin, VersionsObjectManagerMixin, differs
 from apps.generics.chips import Chip
+from apps.service_providers.tracing import TraceInfo, TracingService
 from apps.teams.models import BaseTeamModel, Team
+from apps.teams.utils import current_team
 from apps.utils.models import BaseModel
 from apps.utils.time import seconds_to_human
 from apps.web.meta import absolute_url
@@ -139,47 +136,15 @@ class VersionFieldDisplayFormatters:
     def format_pipeline(pipeline) -> str:
         if not pipeline:
             return ""
-        name = pipeline.name.split(f" v{pipeline.version_number}")[0]
+        name = str(pipeline)
         template = get_template("generic/chip.html")
-        url = (
-            pipeline.get_absolute_url() if pipeline.is_working_version else pipeline.working_version.get_absolute_url()
-        )
+        url = pipeline.get_absolute_url()
         return template.render({"chip": Chip(label=name, url=url)})
 
     @staticmethod
     def format_builtin_tools(tools: set) -> str:
         """code_interpreter, file_search -> Code Interpreter, File Search"""
         return ", ".join([tool.replace("_", " ").capitalize() for tool in tools])
-
-
-class VersionsObjectManagerMixin:
-    def get_all(self):
-        """A method to return all experiments whether it is deprecated or not"""
-        return super().get_queryset()
-
-    def get_queryset(self):
-        query = (
-            super()
-            .get_queryset()
-            .annotate(
-                is_version=Case(
-                    When(working_version_id__isnull=False, then=True),
-                    When(working_version_id__isnull=True, then=False),
-                    output_field=BooleanField(),
-                )
-            )
-        )
-        try:
-            self.model._meta.get_field("is_archived")
-        except FieldDoesNotExist:
-            pass
-        else:
-            query = query.filter(is_archived=False)
-        return query
-
-    def working_versions_queryset(self):
-        """Returns a queryset with only working versions"""
-        return self.get_queryset().filter(working_version=None)
 
 
 class PromptObjectManager(AuditingManager):
@@ -232,89 +197,6 @@ class PromptBuilderHistory(BaseTeamModel):
 
     def __str__(self) -> str:
         return str(self.history)
-
-
-class VersionsMixin:
-    DEFAULT_EXCLUDED_KEYS = ["id", "created_at", "updated_at", "working_version", "versions", "version_number"]
-
-    @transaction.atomic()
-    def create_new_version(self, save=True):
-        """
-        Creates a new version of this instance and sets the `working_version_id` (if this model supports it) to the
-        original instance ID
-        """
-        working_version_id = self.id
-        new_instance = self._meta.model.objects.get(id=working_version_id)
-        new_instance.pk = None
-        new_instance.id = None
-        new_instance._state.adding = True
-        if hasattr(new_instance, "working_version_id"):
-            new_instance.working_version_id = working_version_id
-
-        if save:
-            new_instance.save()
-        return new_instance
-
-    @property
-    def is_a_version(self):
-        """Return whether or not this experiment is a version of an experiment"""
-        return self.working_version is not None
-
-    @property
-    def is_working_version(self):
-        return self.working_version is None
-
-    @property
-    def latest_version(self):
-        return self.versions.order_by("-created_at").first()
-
-    def get_working_version(self) -> "Experiment":
-        """Returns the working version of this experiment family"""
-        if self.is_working_version:
-            return self
-        return self.working_version
-
-    def get_working_version_id(self) -> int:
-        return self.working_version_id if self.working_version_id else self.id
-
-    @property
-    def has_versions(self):
-        return self.versions.exists()
-
-    @property
-    def version_family_ids(self) -> list[int]:
-        """Returns the ids of records in this version family, including the working version"""
-        working_version = self.get_working_version()
-        version_family_ids = [working_version.id]
-        version_family_ids.extend(working_version.versions.values_list("id", flat=True))
-        return version_family_ids
-
-    def get_fields_to_exclude(self):
-        """Returns a list of fields that should be excluded when comparing two versions."""
-        return self.DEFAULT_EXCLUDED_KEYS
-
-    def archive(self):
-        self.is_archived = True
-        self.save(update_fields=["is_archived"])
-
-    def is_editable(self) -> bool:
-        return not self.is_archived
-
-    def get_version_name(self):
-        """Returns version name in form of v + version number, or unreleased if working version."""
-        if self.is_working_version:
-            return "unreleased"
-        return f"v{self.version_number}"
-
-    def get_version_name_list(self):
-        """Returns list of version names in form of v + version number including working version."""
-        versions_list = list(
-            self.versions.annotate(
-                friendly_name=Concat(Value("v"), Cast(F("version_number"), output_field=CharField()))
-            ).values_list("friendly_name", flat=True)
-        )
-        versions_list.append(f"v{self.version_number}")
-        return versions_list
 
 
 @audit_fields(*model_audit_fields.SOURCE_MATERIAL_FIELDS, audit_special_queryset_writes=True)
@@ -919,58 +801,71 @@ class Experiment(BaseTeamModel, VersionsMixin, CustomActionOperationMixin):
         return self.get_api_url()
 
     @transaction.atomic()
-    def create_new_version(self, version_description: str | None = None, make_default: bool = False):
+    def create_new_version(
+        self,
+        version_description: str | None = None,
+        make_default: bool = False,
+        is_copy: bool = False,
+        name: str = None,
+    ):
         """
         Creates a copy of an experiment as a new version of the original experiment.
         """
+        if make_default and is_copy:
+            raise ValueError("Cannot make a copy of an experiment the default version")
+
         version_number = self.version_number
-        self.version_number = version_number + 1
-        self.save(update_fields=["version_number"])
+        if not is_copy:
+            self.version_number = version_number + 1
+            self.save(update_fields=["version_number"])
+        elif self.child_links.exists():
+            raise ValueError("Failed to create copy of chatbot")
 
         # Fetch a new instance so the previous instance reference isn't simply being updated. I am not 100% sure
         # why simply chaing the pk, id and _state.adding wasn't enough.
-        new_version = super().create_new_version(save=False)
+        new_version = super().create_new_version(save=False, is_copy=is_copy)
         new_version.version_description = version_description or ""
         new_version.public_id = uuid4()
         new_version.version_number = version_number
 
-        self._copy_attr_to_new_version("source_material", new_version)
-        self._copy_attr_to_new_version("consent_form", new_version)
-        self._copy_attr_to_new_version("pre_survey", new_version)
-        self._copy_attr_to_new_version("post_survey", new_version)
-
-        if new_version.version_number == 1 or make_default:
+        if not is_copy and (new_version.version_number == 1 or make_default):
             new_version.is_default_version = True
 
         if make_default:
             self.versions.filter(is_default_version=True).update(
                 is_default_version=False, audit_action=AuditAction.AUDIT
             )
-
+        if is_copy:
+            new_version.name = name if name is not None else new_version.name + "_copy"
+            new_version.version_number = 1
         new_version.save()
 
-        self._copy_safety_layers_to_new_version(new_version)
-        self._copy_routes_to_new_version(new_version)
-        self._copy_trigger_to_new_version(trigger_queryset=self.static_triggers, new_version=new_version)
-        self._copy_trigger_to_new_version(trigger_queryset=self.timeout_triggers, new_version=new_version)
-        self._copy_pipeline_to_new_version(new_version)
-        self._copy_custom_action_operations_to_new_version(new_experiment=new_version)
-        self._copy_assistant_to_new_version(new_version)
+        if not is_copy:
+            # nothing to do for copy - just reference the same object in the new copy
+            self._copy_attr_to_new_version("source_material", new_version)
+            self._copy_attr_to_new_version("consent_form", new_version)
+            self._copy_attr_to_new_version("pre_survey", new_version)
+            self._copy_attr_to_new_version("post_survey", new_version)
+            self._copy_assistant_to_new_version(new_version)
+
+            # not supported for copying
+            self._copy_routes_to_new_version(new_version)
+
+        self._copy_safety_layers_to_new_version(new_version, is_copy)
+        self._copy_trigger_to_new_version(
+            trigger_queryset=self.static_triggers, new_version=new_version, is_copy=is_copy
+        )
+        self._copy_trigger_to_new_version(
+            trigger_queryset=self.timeout_triggers, new_version=new_version, is_copy=is_copy
+        )
+        self._copy_pipeline_to_new_version(new_version, is_copy)
+        self._copy_custom_action_operations_to_new_version(new_experiment=new_version, is_copy=is_copy)
 
         new_version.files.set(self.files.all())
         return new_version
 
     def get_fields_to_exclude(self):
         return super().get_fields_to_exclude() + ["is_default_version", "public_id", "version_description"]
-
-    def compare_with_latest(self):
-        """
-        Returns a boolean if the experiment differs from the lastest version
-        """
-        version = self.version_details
-        if prev_version := self.latest_version:
-            version.compare(prev_version.version_details, early_abort=True)
-        return version.fields_changed
 
     @transaction.atomic()
     def archive(self):
@@ -997,10 +892,14 @@ class Experiment(BaseTeamModel, VersionsMixin, CustomActionOperationMixin):
         for channel in ExperimentChannel.objects.filter(experiment_id=self.id):
             channel.soft_delete()
 
-    def _copy_pipeline_to_new_version(self, new_version):
+    def _copy_pipeline_to_new_version(self, new_version, is_copy: bool = False):
         if not self.pipeline:
             return
-        new_version.pipeline = self.pipeline.create_new_version()
+        new_pipeline = self.pipeline.create_new_version(is_copy=is_copy)
+        if is_copy:
+            new_pipeline.name = new_version.name
+            new_pipeline.save(update_fields=["name"])
+        new_version.pipeline = new_pipeline
         new_version.save(update_fields=["pipeline"])
 
     def _copy_assistant_to_new_version(self, new_version):
@@ -1034,11 +933,14 @@ class Experiment(BaseTeamModel, VersionsMixin, CustomActionOperationMixin):
         else:
             setattr(new_version, attr_name, attr_instance.create_new_version())
 
-    def _copy_safety_layers_to_new_version(self, new_version: "Experiment"):
-        duplicated_layers = []
-        for layer in self.safety_layers.all():
-            duplicated_layers.append(layer.create_new_version())
-        new_version.safety_layers.set(duplicated_layers)
+    def _copy_safety_layers_to_new_version(self, new_version: "Experiment", is_copy: bool = False):
+        if is_copy:
+            new_version.safety_layers.set(self.safety_layers.all())
+        else:
+            duplicated_layers = []
+            for layer in self.safety_layers.all():
+                duplicated_layers.append(layer.create_new_version())
+            new_version.safety_layers.set(duplicated_layers)
 
     def _copy_routes_to_new_version(self, new_version: "Experiment"):
         """
@@ -1048,9 +950,9 @@ class Experiment(BaseTeamModel, VersionsMixin, CustomActionOperationMixin):
         for route in self.child_links.all():
             route.create_new_version(new_version)
 
-    def _copy_trigger_to_new_version(self, trigger_queryset, new_version):
+    def _copy_trigger_to_new_version(self, trigger_queryset, new_version, is_copy: bool = False):
         for trigger in trigger_queryset.all():
-            trigger.create_new_version(new_experiment=new_version)
+            trigger.create_new_version(new_experiment=new_version, is_copy=is_copy)
 
     @property
     def is_public(self) -> bool:
@@ -1474,12 +1376,6 @@ class Participant(BaseTeamModel):
         scheduled_messages = []
         for message in messages:
             if as_dict:
-                next_trigger_date = message.next_trigger_date
-                last_triggered_at = message.last_triggered_at
-                if as_timezone:
-                    next_trigger_date = next_trigger_date.astimezone(pytz.timezone(as_timezone))
-                    if last_triggered_at:
-                        last_triggered_at = last_triggered_at.astimezone(pytz.timezone(as_timezone))
                 scheduled_messages.append(message.as_dict(as_timezone=as_timezone))
             else:
                 scheduled_messages.append(message.as_string(as_timezone=as_timezone))
@@ -1571,18 +1467,19 @@ class SessionStatus(models.TextChoices):
 
 
 class ExperimentSessionObjectManager(models.Manager):
-    def for_chat_id(self, chat_id: str) -> list["ExperimentSession"]:
-        return self.filter(participant__identifier=chat_id)
-
     def with_last_message_created_at(self):
-        last_message_created_at = (
+        return self.annotate_with_last_message_created_at(self.get_queryset())
+
+    @staticmethod
+    def annotate_with_last_message_created_at(queryset):
+        last_message_subquery = (
             ChatMessage.objects.filter(
                 chat__experiment_session=models.OuterRef("pk"),
             )
             .order_by("-created_at")
             .values("created_at")[:1]
         )
-        return self.annotate(last_message_created_at=models.Subquery(last_message_created_at))
+        return queryset.annotate(last_message_created_at=models.Subquery(last_message_subquery))
 
 
 class ExperimentSession(BaseTeamModel):
@@ -1714,32 +1611,44 @@ class ExperimentSession(BaseTeamModel):
 
             enqueue_static_triggers.delay(self.id, StaticTriggerType.CONVERSATION_END)
 
-    def ad_hoc_bot_message(self, instruction_prompt: str, fail_silently=True, use_experiment: Experiment | None = None):
+    def ad_hoc_bot_message(
+        self,
+        instruction_prompt: str,
+        trace_info: TraceInfo,
+        fail_silently=True,
+        use_experiment: Experiment | None = None,
+    ):
         """Sends a bot message to this session. The bot message will be crafted using `instruction_prompt` and
         this session's history.
 
         Parameters:
             instruction_prompt: The instruction prompt for the LLM
+            trace_info: Metadata for adding to the trace
             fail_silently: Exceptions will not be suppresed if this is True
             use_experiment: The experiment whose data to use. This is useful for multi-bot setups where we want a
             specific child bot to handle the check-in.
         """
-        bot_message = self._bot_prompt_for_user(instruction_prompt=instruction_prompt, use_experiment=use_experiment)
-        self.try_send_message(message=bot_message, fail_silently=fail_silently)
+        with current_team(self.team):
+            bot_message = self._bot_prompt_for_user(instruction_prompt, trace_info, use_experiment=use_experiment)
+            self.try_send_message(message=bot_message, fail_silently=fail_silently)
 
-    def _bot_prompt_for_user(self, instruction_prompt: str, use_experiment: Experiment | None = None) -> str:
+    def _bot_prompt_for_user(
+        self,
+        instruction_prompt: str,
+        trace_info: TraceInfo,
+        use_experiment: Experiment | None = None,
+    ) -> str:
         """Sends the `instruction_prompt` along with the chat history to the LLM to formulate an appropriate prompt
         message. The response from the bot will be saved to the chat history.
         """
         from apps.chat.bots import EventBot
+        from apps.service_providers.llm_service.history_managers import ExperimentHistoryManager
 
-        bot = EventBot(self, use_experiment)
-        message = bot.get_user_message(instruction_prompt)
-        chat_message = ChatMessage.objects.create(chat=self.chat, message_type=ChatMessageType.AI, content=message)
-        chat_message.add_version_tag(
-            version_number=bot.experiment.version_number, is_a_version=bot.experiment.is_a_version
-        )
-        return message
+        experiment = use_experiment or self.experiment
+        trace_service = TracingService.create_for_experiment(self.experiment)
+        history_manager = ExperimentHistoryManager(session=self, experiment=experiment, trace_service=trace_service)
+        bot = EventBot(self, experiment, trace_info, history_manager)
+        return bot.get_user_message(instruction_prompt)
 
     def try_send_message(self, message: str, fail_silently=True):
         """Tries to send a message to this user session as the bot. Note that `message` will be send to the user

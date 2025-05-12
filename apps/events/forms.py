@@ -52,7 +52,7 @@ class PipelineStartForm(forms.Form):
     def __init__(self, *args, **kwargs):
         team_id = kwargs.pop("team_id")
         super().__init__(*args, **kwargs)
-        self.fields["pipeline_id"].queryset = Pipeline.objects.filter(team_id=team_id)
+        self.fields["pipeline_id"].queryset = Pipeline.objects.filter(team_id=team_id, working_version_id__isnull=True)
 
     def clean_pipeline_id(self):
         return self.cleaned_data["pipeline_id"].id
@@ -120,9 +120,8 @@ class EventActionForm(forms.ModelForm):
                 raise forms.ValidationError("This action is not allowed when 'A new bot message is received'")
         return cleaned_data
 
-    def save(self, commit=True, *args, **kwargs):
-        experiment_id = kwargs.pop("experiment_id")
-        instance = super().save(commit=False, *args, **kwargs)
+    def save(self, commit=True, experiment_id=None):
+        instance = super().save(commit=False)
         instance.experiment_id = experiment_id
         if commit:
             instance.save()
@@ -157,9 +156,8 @@ def get_action_params_form(data=None, instance=None, team_id=None, experiment_id
 
 
 class BaseTriggerForm(forms.ModelForm):
-    def save(self, commit=True, *args, **kwargs):
-        experiment_id = kwargs.pop("experiment_id")
-        instance = super().save(commit=False, *args, **kwargs)
+    def save(self, commit=True, experiment_id=None):
+        instance = super().save(commit=False)
         instance.experiment_id = experiment_id
         if commit:
             instance.save()

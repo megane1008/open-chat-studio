@@ -4,6 +4,7 @@ from django.http import Http404, HttpResponse
 from django.test import RequestFactory, TestCase
 from django.views import View
 
+from apps.conftest import unset_current_team
 from apps.teams.backends import add_user_to_team, make_user_team_owner
 from apps.teams.middleware import TeamsMiddleware
 from apps.teams.mixins import LoginAndTeamRequiredMixin
@@ -58,17 +59,20 @@ class TeamMixinTest(TestCase):
 
     def assertSuccessfulRequest(self, view_cls, user, team_slug):
         response = self._call_view(view_cls, user, team_slug)
-        assert 200 == response.status_code
+        assert response.status_code == 200
         assert f"Go {team_slug}" == response.content.decode("utf-8")
+        unset_current_team()
 
     def assertRedirectToLogin(self, view_cls, user, team_slug):
         response = self._call_view(view_cls, user, team_slug)
-        assert 302 == response.status_code
+        assert response.status_code == 302
         assert "/login/" in response.url
+        unset_current_team()
 
     def assertNotFound(self, view_cls, user, team_slug):
         with pytest.raises(Http404):
             self._call_view(view_cls, user, team_slug)
+        unset_current_team()
 
     def test_anonymous_user_redirect_to_login(self):
         self.assertRedirectToLogin(MemberView, AnonymousUser(), "sox")

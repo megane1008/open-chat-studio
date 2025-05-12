@@ -1,5 +1,5 @@
+import contextlib
 import logging
-from abc import ABC, abstractmethod
 
 from langchain.chains.conversation.base import ConversationChain
 from langchain.chains.llm import LLMChain
@@ -8,38 +8,40 @@ from langchain_anthropic import ChatAnthropic
 from langchain_community.callbacks import get_openai_callback
 from langchain_core.language_models import BaseChatModel
 from langchain_core.memory import BaseMemory
-from langchain_core.messages import BaseMessage, SystemMessage, get_buffer_string
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, get_buffer_string
 from langchain_core.prompts import (
     HumanMessagePromptTemplate,
     MessagesPlaceholder,
     SystemMessagePromptTemplate,
 )
+from langchain_core.prompts.prompt import PromptTemplate
 
+from apps.chat.exceptions import ChatException
 from apps.chat.models import Chat, ChatMessage, ChatMessageType
 from apps.pipelines.models import PipelineChatHistory, PipelineChatHistoryModes, PipelineChatMessages
 from apps.utils.prompt import OcsPromptTemplate
 
 SUMMARY_TOO_LARGE_ERROR_MESSAGE = "Unable to compress chat history: existing summary too large"
+MESSAGES_TOO_LARGE_ERROR_MESSAGE = (
+    "Unable to compress chat history: Messages are too large for the context window of {tokens} tokens"
+)
 INITIAL_SUMMARY_TOKENS_ESTIMATE = 20
 # The maximum number of messages that can be uncompressed
 MAX_UNCOMPRESSED_MESSAGES = 1000
 
+_SUMMARY_COMPRESSION_TEMPLATE = """Compress this summary into a shorter summary, about half of its original size:
+    SUMMARY:
+    {summary}
+
+    Shorter summary:
+"""
+
+SUMMARY_COMPRESSION_PROMPT = PromptTemplate.from_template(_SUMMARY_COMPRESSION_TEMPLATE)
+
 log = logging.getLogger("ocs.bots")
 
 
-class Conversation(ABC):
-    @abstractmethod
-    def predict(self, input: str) -> tuple[str, int, int]:
-        raise NotImplementedError
-
-    def load_memory_from_chat(self, chat: Chat, max_token_limit: int):
-        pass
-
-    def load_memory_from_messages(self, messages):
-        pass
-
-
-class BasicConversation(Conversation):
+class BasicConversation:
     """
     A wrapper class that provides a single way/API to interact with the LLMs, regardless of it being a normal
     conversation or agent implementation
@@ -74,11 +76,8 @@ class BasicConversation(Conversation):
     def system_prompt(self):
         prompt_to_use = SystemMessagePromptTemplate.from_template(self.prompt_str)
         if self.source_material:
-            try:
+            with contextlib.suppress(KeyError):
                 prompt_to_use = prompt_to_use.format(source_material=self.source_material)
-            except KeyError:
-                # no source material found in prompt, just use it "naked"
-                pass
         return prompt_to_use
 
     def load_memory_from_messages(self, messages: list[BaseMessage]):
@@ -247,8 +246,16 @@ def summarize_history(llm, history, max_token_limit, input_message_tokens, summa
             pruned_memory.extend(pruned_messages)
             history_tokens = llm.get_num_tokens_from_messages(history)
         # Generate a new summary after pruning messages
-        summary = _get_new_summary(llm, pruned_memory, summary, max_token_limit)
-        summary_tokens = llm.get_num_tokens_from_messages([SystemMessage(content=summary)])
+        summary_token_limit = max_token_limit - history_tokens - input_message_tokens
+        try:
+            summary = _get_new_summary(llm, pruned_memory, summary, model_token_limit=max_token_limit)
+            summary_tokens = llm.get_num_tokens_from_messages([SystemMessage(content=summary)])
+            if summary and summary_tokens > summary_token_limit:
+                summary, summary_token_limit = _reduce_summary_size(llm, summary, summary_token_limit)
+        except ChatException as e:
+            log.exception("Error while generating summary: %s", e)
+            summary = ""
+            break
 
     return history, pruned_memory, summary
 
@@ -305,31 +312,71 @@ def _messages_exceeds_limit(history, input_messages) -> bool:
     return history and len(history) + len(input_messages) > MAX_UNCOMPRESSED_MESSAGES
 
 
-def _get_new_summary(llm, pruned_memory, summary, max_token_limit):
+def _get_new_summary(llm, pruned_memory, summary, model_token_limit, first_call=True):
     """Get a new summary from the pruned memory. If the pruned memory is still too long, prune it further and
     recursively call this function with the remaining memory."""
-    tokens, context = _get_summary_tokens_with_context(llm, summary, pruned_memory)
-    next_batch = []
-    while pruned_memory and tokens > max_token_limit or len(pruned_memory) > MAX_UNCOMPRESSED_MESSAGES:
-        next_batch.insert(0, pruned_memory.pop())
-        tokens, context = _get_summary_tokens_with_context(llm, summary, pruned_memory)
+    summary = summary or ""
 
-    if not context["new_lines"]:
-        log.error(SUMMARY_TOO_LARGE_ERROR_MESSAGE)
-        # If the summary is too large, discard it and compute a new summary from the pruned memory
-        return _get_new_summary(llm, next_batch, None, max_token_limit)
+    if not pruned_memory:
+        return summary
+    if first_call:
+        pruned_memory = [
+            HumanMessage(
+                " ".join(msg.content.split()[:1000]) + " ..." if len(msg.content.split()) > 1000 else msg.content
+            )
+            for msg in pruned_memory
+            if msg.content
+        ]
+
+    summarization_prompt_tokens, context = _get_summarization_prompt_tokens_with_context(llm, summary, pruned_memory)
+    next_batch = []
+
+    while (
+        pruned_memory
+        and summarization_prompt_tokens > model_token_limit
+        or len(pruned_memory) > MAX_UNCOMPRESSED_MESSAGES
+    ):
+        next_batch.insert(0, pruned_memory.pop())
+        summarization_prompt_tokens, context = _get_summarization_prompt_tokens_with_context(
+            llm, summary, pruned_memory
+        )
+
+    if not pruned_memory:
+        if first_call:
+            if summary:
+                log.error(SUMMARY_TOO_LARGE_ERROR_MESSAGE)
+            else:
+                log.error(MESSAGES_TOO_LARGE_ERROR_MESSAGE.format(tokens=model_token_limit))
+            return _get_new_summary(llm, next_batch, "", model_token_limit, False)
+        else:
+            raise ChatException("Unable to compress history")
 
     chain = LLMChain(llm=llm, prompt=SUMMARY_PROMPT, name="compress_chat_history")
     summary = chain.invoke(context)["text"]
 
     if next_batch:
-        return _get_new_summary(llm, next_batch, summary, max_token_limit)
+        return _get_new_summary(llm, next_batch, summary, model_token_limit, False)
 
     return summary
 
 
-def _get_summary_tokens_with_context(llm, summary, pruned_memory):
+def _get_summarization_prompt_tokens_with_context(llm, summary, pruned_memory):
     new_lines = get_buffer_string(pruned_memory)
     context = {"summary": summary or "", "new_lines": new_lines}
     tokens = llm.get_num_tokens_from_messages(SUMMARY_PROMPT.format_prompt(**context).to_messages())
     return tokens, context
+
+
+def _reduce_summary_size(llm, summary, summary_token_limit) -> tuple:
+    summary_tokens = llm.get_num_tokens_from_messages([SystemMessage(content=summary)])
+    attempts = 0
+    while summary and summary_tokens > summary_token_limit:
+        if attempts == 3:
+            log.exception("Too many attempts trying to reduce summary size.")
+            return "", 0
+        chain = LLMChain(llm=llm, prompt=SUMMARY_COMPRESSION_PROMPT, name="compress_chat_history")
+        summary = chain.invoke({"summary": summary})["text"]
+        summary_tokens = llm.get_num_tokens_from_messages([SystemMessage(content=summary)])
+        attempts += 1
+
+    return summary, summary_tokens

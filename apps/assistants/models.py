@@ -1,5 +1,3 @@
-from typing import Self
-
 from django.contrib.postgres.fields import ArrayField
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models, transaction
@@ -10,8 +8,8 @@ from field_audit.models import AuditAction, AuditingManager
 
 from apps.chat.agent.tools import get_assistant_tools
 from apps.custom_actions.mixins import CustomActionOperationMixin
-from apps.experiments.models import Experiment, VersionsMixin, VersionsObjectManagerMixin
-from apps.experiments.versioning import VersionDetails, VersionField
+from apps.experiments.models import Experiment
+from apps.experiments.versioning import VersionDetails, VersionField, VersionsMixin, VersionsObjectManagerMixin
 from apps.pipelines.models import Node
 from apps.teams.models import BaseTeamModel
 from apps.utils.models import BaseModel
@@ -106,17 +104,14 @@ class OpenAiAssistant(BaseTeamModel, VersionsMixin, CustomActionOperationMixin):
     def has_custom_actions(self):
         return self.custom_action_operations.exists()
 
-    def get_fields_to_exclude(self):
-        return super().get_fields_to_exclude() + ["assistant_id", "name"]
-
     @transaction.atomic()
-    def create_new_version(self, *args, **kwargs):
+    def create_new_version(self):
         from .sync import push_assistant_to_openai
 
         version_number = self.version_number
         self.version_number = version_number + 1
         self.save(update_fields=["version_number"])
-        assistant_version = super().create_new_version(save=False, *args, **kwargs)
+        assistant_version = super().create_new_version(save=False)
         assistant_version.version_number = version_number
         assistant_version.name = f"{self.name} v{version_number}"
         assistant_version.assistant_id = ""
@@ -139,37 +134,6 @@ class OpenAiAssistant(BaseTeamModel, VersionsMixin, CustomActionOperationMixin):
 
         push_assistant_to_openai(assistant_version, internal_tools=get_assistant_tools(assistant_version))
         return assistant_version
-
-    def compare_with_model(self, new: Self, exclude_fields: list[str], early_abort=False) -> set:
-        changes = super().compare_with_model(new, exclude_fields, early_abort=early_abort)
-        if early_abort and changes:
-            return changes
-
-        new_name = new.name.split(f" v{new.version_number}")[0]
-        if self.name != new_name:
-            changes.add("name")
-
-        tool_resources = {r.tool_type: r for r in self.tool_resources.all()}
-        new_tool_resources = {r.tool_type: r for r in new.tool_resources.all()}
-        if set(tool_resources) != set(new_tool_resources):
-            changes.add("tool_resources")
-        else:
-            exclude_fields = self.DEFAULT_EXCLUDED_KEYS + ["extra", "assistant"]
-            for tool_type, resource in tool_resources.items():
-                new_resource = new_tool_resources[tool_type]
-                if tool_changes := resource.compare_with_model(new_resource, exclude_fields, early_abort=early_abort):
-                    changes.update([f"tool_resources.{tool_type}.{change}" for change in tool_changes])
-
-        if early_abort and changes:
-            return changes
-
-        custom_actions = VersionField("custom_actions", queryset=self.custom_action_operations.all())
-        custom_actions.compare(
-            VersionField("custom_actions", queryset=new.custom_action_operations.all()), early_abort=early_abort
-        )
-        if custom_actions.changed:
-            changes.add("custom_actions")
-        return changes
 
     def archive(self):
         from apps.assistants.tasks import delete_openai_assistant_task

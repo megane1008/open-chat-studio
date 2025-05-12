@@ -3,32 +3,39 @@ import uuid
 from django.contrib.auth.decorators import permission_required
 from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.http import HttpResponseRedirect
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
+from django.views.decorators.clickjacking import xframe_options_exempt
 from django.views.decorators.http import require_POST
 from django.views.generic import TemplateView
 
 from apps.chat.channels import WebChannel
-from apps.chatbots.forms import ChatbotForm
+from apps.chatbots.forms import ChatbotForm, CopyChatbotForm
 from apps.chatbots.tables import ChatbotSessionsTable, ChatbotTable
 from apps.experiments.decorators import experiment_session_view, verify_session_access_cookie
-from apps.experiments.models import Experiment
+from apps.experiments.models import Experiment, SessionStatus
 from apps.experiments.tables import ExperimentVersionsTable
+from apps.experiments.tasks import async_create_experiment_version
 from apps.experiments.views import CreateExperiment, ExperimentSessionsTableView, ExperimentVersionsTableView
 from apps.experiments.views.experiment import (
     BaseExperimentView,
     CreateExperimentVersion,
     base_single_experiment_view,
+    experiment_chat,
+    experiment_chat_embed,
     experiment_chat_session,
     experiment_invitations,
     experiment_version_details,
+    start_session_public,
+    start_session_public_embed,
     version_create_status,
 )
 from apps.generics.views import generic_home, paginate_session, render_session_details
 from apps.pipelines.views import _pipeline_node_default_values, _pipeline_node_parameter_values, _pipeline_node_schemas
 from apps.service_providers.models import LlmProvider, LlmProviderModel
-from apps.teams.decorators import login_and_team_required
+from apps.teams.decorators import login_and_team_required, team_required
 from apps.teams.mixins import LoginAndTeamRequiredMixin
+from apps.teams.models import Flag
 from apps.utils.base_experiment_table_view import BaseExperimentTableView
 
 
@@ -62,7 +69,7 @@ class CreateChatbot(CreateExperiment, BaseExperimentView):
         return context
 
     def get_success_url(self):
-        return reverse("chatbots:edit", args=[self.request.team.slug, self.object.pipeline.id])
+        return reverse("chatbots:edit", args=[self.request.team.slug, self.object.id])
 
 
 @login_and_team_required
@@ -81,12 +88,17 @@ class EditChatbot(LoginAndTeamRequiredMixin, TemplateView, PermissionRequiredMix
         data = super().get_context_data(**kwargs)
         llm_providers = LlmProvider.objects.filter(team=self.request.team).values("id", "name", "type").all()
         llm_provider_models = LlmProviderModel.objects.for_team(self.request.team).all()
+        experiment = get_object_or_404(Experiment.objects.get_all(), id=kwargs["pk"], team=self.request.team)
+
         return {
             **data,
-            "pipeline_id": kwargs["pk"],
+            "pipeline_id": experiment.pipeline_id,
             "node_schemas": _pipeline_node_schemas(),
+            "experiment": experiment,
             "parameter_values": _pipeline_node_parameter_values(self.request.team, llm_providers, llm_provider_models),
             "default_values": _pipeline_node_default_values(llm_providers, llm_provider_models),
+            "origin": "chatbots",
+            "flags_enabled": [flag.name for flag in Flag.objects.all() if flag.is_active_for_team(self.request.team)],
         }
 
 
@@ -185,5 +197,53 @@ def start_authed_web_session(request, team_slug: str, experiment_id: int, versio
     )
 
 
+@login_and_team_required
 def chatbot_invitations(request, team_slug: str, experiment_id: int):
     return experiment_invitations(request, team_slug, experiment_id, "chatbots")
+
+
+@team_required
+def start_chatbot_session_public(request, team_slug: str, experiment_id: uuid.UUID):
+    return start_session_public(request, team_slug, experiment_id)
+
+
+@experiment_session_view(allowed_states=[SessionStatus.ACTIVE, SessionStatus.SETUP])
+@verify_session_access_cookie
+def chatbot_chat(request, team_slug: str, experiment_id: uuid.UUID, session_id: str):
+    return experiment_chat(request, team_slug, experiment_id, session_id)
+
+
+@xframe_options_exempt
+@team_required
+def start_chatbot_session_public_embed(request, team_slug: str, experiment_id: uuid.UUID):
+    return start_session_public_embed(request, team_slug, experiment_id)
+
+
+@experiment_session_view(allowed_states=[SessionStatus.ACTIVE, SessionStatus.SETUP])
+@xframe_options_exempt
+def chatbot_chat_embed(request, team_slug: str, experiment_id: uuid.UUID, session_id: str):
+    return experiment_chat_embed(request, team_slug, experiment_id, session_id)
+
+
+@login_and_team_required
+def copy_chatbot(request, team_slug, *args, **kwargs):
+    if request.method == "POST":
+        form = CopyChatbotForm(request.POST)
+        if form.is_valid():
+            new_name = form.cleaned_data["new_name"]
+            experiment = get_object_or_404(Experiment.objects.get_all(), id=kwargs["pk"], team=request.team)
+            # copy chatbot
+            new_experiment = experiment.create_new_version(make_default=False, is_copy=True, name=new_name)
+            # create default version for copied chatbot
+            task_id = async_create_experiment_version.delay(
+                experiment_id=new_experiment.id, version_description="", make_default=True
+            )
+            new_experiment.create_version_task_id = task_id
+            new_experiment.save(update_fields=["create_version_task_id"])
+        referer = request.headers.get("referer")
+        if "experiments" in referer:
+            return redirect("experiments:single_experiment_home", team_slug=team_slug, experiment_id=new_experiment.id)
+        return redirect("chatbots:single_chatbot_home", team_slug=team_slug, experiment_id=new_experiment.id)
+    else:
+        experiment_id = kwargs["pk"]
+        return single_chatbot_home(request, team_slug, experiment_id)

@@ -1,7 +1,7 @@
 import dataclasses
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 from unittest import mock
 from unittest.mock import patch
 
@@ -11,8 +11,9 @@ from langchain_core.callbacks import BaseCallbackHandler, CallbackManagerForLLMR
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, BaseMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import RunnableConfig, RunnableLambda, RunnableSerializable
+from langchain_core.runnables import RunnableConfig, RunnableSerializable
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.utils.pydantic import TypeBaseModel, is_basemodel_subclass
 from openai import OpenAI
 from pydantic import ConfigDict
 
@@ -67,14 +68,22 @@ class FakeLlm(FakeListChatModel):
     def bind_tools(self, tools, *args, **kwargs):
         return self.bind(tools=[convert_to_openai_tool(tool) for tool in tools])
 
-    def with_structured_output(self, schema) -> dict:
-        """with_structured_output should return a runnable that returns a dictionary, so we simply replace the LLM
-        with a runnable lambda that returns the dictionary that we specified when we built the FakeLlm:
+    def with_structured_output(self, schema) -> RunnableSerializable:
+        """with_structured_output returns a runnable that handles both regular message inputs and ChatPromptValue
+        inputs, converting the result to the schema's expected format.
 
-        Example:
+        Examples:
             FakeLlm(responses=[{"name": "John"}]).with_structured_output(...) -> {"name": "John"}
+            FakeLlm(responses=["keyword"]).with_structured_output(router_schema) -> {"route": "keyword"}
+            FakeLlm(responses=[AIMessage(content="value")]).with_structured_output(...) -> {"route": "value"}
         """
-        return RunnableLambda(lambda message, *args, **kwargs: self._call([message]))
+        from langchain_core.output_parsers.openai_tools import PydanticToolsParser
+
+        if isinstance(schema, type) and is_basemodel_subclass(schema):
+            output_parser = PydanticToolsParser(tools=[cast(TypeBaseModel, schema)], first_tool_only=True)
+            llm = self.bind_tools([schema], tool_choice="any")
+            return llm | output_parser
+        raise Exception("Unsupported schema type, only pydantic models are supported")
 
 
 @dataclasses.dataclass
@@ -144,7 +153,6 @@ class FakeLlmEcho(FakeLlmSimpleTokenCount):
 
     def _call(self, messages: list[BaseMessage], *args, **kwargs) -> str | BaseMessage:
         """Returns "{system_message} {user_message}" """
-
         self.calls.append(mock.call(messages, *args, **kwargs))
 
         user_message = messages[-1].content

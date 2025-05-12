@@ -17,6 +17,7 @@ from langchain_core.prompts import MessagesPlaceholder, PromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, BeforeValidator, Field, create_model, field_validator, model_validator
+from pydantic import ValidationError as PydanticValidationError
 from pydantic.config import ConfigDict
 from pydantic_core import PydanticCustomError
 from pydantic_core.core_schema import FieldValidationInfo
@@ -32,6 +33,7 @@ from apps.pipelines.nodes.base import (
     NodeSchema,
     OptionsSource,
     PipelineNode,
+    PipelineRouterNode,
     PipelineState,
     UiSchema,
     Widgets,
@@ -41,6 +43,7 @@ from apps.pipelines.tasks import send_email_from_pipeline
 from apps.service_providers.exceptions import ServiceProviderConfigError
 from apps.service_providers.llm_service.adapters import AssistantAdapter, ChatAdapter
 from apps.service_providers.llm_service.history_managers import PipelineHistoryManager
+from apps.service_providers.llm_service.prompt_context import PromptTemplateContext
 from apps.service_providers.llm_service.runnables import (
     AgentAssistantChat,
     AgentLLMChat,
@@ -100,7 +103,7 @@ class RenderTemplate(PipelineNode):
             output = template.render(content)
         except Exception as e:
             self.logger.error(f"Template rendering failed: {e}")
-            raise PipelineNodeRunError(f"Error rendering template: {e}")
+            raise PipelineNodeRunError(f"Error rendering template: {e}") from e
 
         return PipelineState.from_node_output(node_name=self.name, node_id=node_id, output=output)
 
@@ -119,7 +122,7 @@ class LLMResponseMixin(BaseModel):
             provider = LlmProvider.objects.get(id=self.llm_provider_id)
             return provider.get_llm_service()
         except LlmProvider.DoesNotExist:
-            raise PipelineNodeBuildError(f"LLM provider with id {self.llm_provider_id} does not exist")
+            raise PipelineNodeBuildError(f"LLM provider with id {self.llm_provider_id} does not exist") from None
         except ServiceProviderConfigError as e:
             raise PipelineNodeBuildError("There was an issue configuring the LLM service provider") from e
 
@@ -127,7 +130,9 @@ class LLMResponseMixin(BaseModel):
         try:
             return LlmProviderModel.objects.get(id=self.llm_provider_model_id)
         except LlmProviderModel.DoesNotExist:
-            raise PipelineNodeBuildError(f"LLM provider model with id {self.llm_provider_model_id} does not exist")
+            raise PipelineNodeBuildError(
+                f"LLM provider model with id {self.llm_provider_model_id} does not exist"
+            ) from None
 
     def get_chat_model(self):
         return self.get_llm_service().get_chat_model(self.get_llm_provider_model().name, self.llm_temperature)
@@ -279,7 +284,9 @@ class LLMResponseWithPrompt(LLMResponse, HistoryMixin):
             validate_prompt_variables(context=context, prompt_key="prompt", known_vars=set(PromptVars.values))
             return self
         except ValidationError as e:
-            raise PydanticCustomError("invalid_prompt", e.error_dict["prompt"][0].message, {"field": "prompt"})
+            raise PydanticCustomError(
+                "invalid_prompt", e.error_dict["prompt"][0].message, {"field": "prompt"}
+            ) from None
 
     @field_validator("tools", mode="before")
     def ensure_value(cls, value: str):
@@ -357,7 +364,7 @@ class SendEmail(PipelineNode):
             try:
                 validate_email(email)
             except ValidationError:
-                raise PydanticCustomError("invalid_recipient_list", "Invalid list of emails addresses")
+                raise PydanticCustomError("invalid_recipient_list", "Invalid list of emails addresses") from None
         return value
 
     def _process(self, input, node_id: str, **kwargs) -> PipelineState:
@@ -374,7 +381,7 @@ class Passthrough(PipelineNode):
 
     def _process(self, input, state: PipelineState, node_id: str) -> PipelineState:
         if self.logger:
-            self.logger.debug(f"Returning input: '{input}' without modification", input=input, output=input)
+            self.logger.debug(f"Returning input: '{input}' without modification")
         return PipelineState.from_node_output(node_name=self.name, node_id=node_id, output=input)
 
 
@@ -393,12 +400,17 @@ class EndNode(Passthrough):
 
 
 @deprecated_node(message="Use the 'Router' node instead.")
-class BooleanNode(Passthrough):
+class BooleanNode(PipelineRouterNode):
     """Branches based whether the input matches a certain value"""
 
     model_config = ConfigDict(json_schema_extra=NodeSchema(label="Conditional Node"))
 
     input_equals: str
+    tag_output_message: bool = Field(
+        default=False,
+        description="Tag the output message with the selected route",
+        json_schema_extra=UiSchema(widget=Widgets.toggle),
+    )
 
     def _process_conditional(self, state: PipelineState, node_id: str | None = None) -> Literal["true", "false"]:
         if self.input_equals == state["messages"][-1]:
@@ -406,63 +418,100 @@ class BooleanNode(Passthrough):
         return "false"
 
     def get_output_map(self):
-        """A mapping from the output handles on the frontend to the return values of process_conditional"""
+        """A mapping from the output handles on the frontend to the return values of _process_conditional"""
         return {"output_0": "true", "output_1": "false"}
+
+    def get_output_tags(self, selected_route) -> list[str]:
+        if self.tag_output_message:
+            return [f"{self.name}:{selected_route}"]
+        return []
 
 
 class RouterMixin(BaseModel):
     keywords: list[str] = Field(default_factory=list, json_schema_extra=UiSchema(widget=Widgets.keywords))
+    default_keyword_index: int = Field(default=0)
+    tag_output_message: bool = Field(
+        default=False,
+        description="Tag the output message with the selected route",
+        json_schema_extra=UiSchema(widget=Widgets.toggle),
+    )
 
     @field_validator("keywords")
     def ensure_keywords_exist(cls, value, info: FieldValidationInfo):
         if not all(entry for entry in value):
             raise PydanticCustomError("invalid_keywords", "Keywords cannot be empty")
-
         if len(set(value)) != len(value):
             raise PydanticCustomError("invalid_keywords", "Keywords must be unique")
-
         return value
 
-    def _get_keyword(self, result: str):
-        keyword = result.lower().strip()
-        if keyword in [k.lower() for k in self.keywords]:
-            return keyword.lower()
-        else:
-            return self.keywords[0].lower()
+    def _create_router_schema(self):
+        """Create a Pydantic model for structured router output"""
+        return create_model(
+            "RouterOutput", route=(Literal[tuple(self.keywords)], Field(description="Selected routing destination"))
+        )
 
     def get_output_map(self):
         """Returns a mapping of the form:
         {"output_1": "keyword 1", "output_2": "keyword_2", ...} where keywords are defined by the user
         """
-        return {f"output_{output_num}": keyword.lower() for output_num, keyword in enumerate(self.keywords)}
+        return {f"output_{output_num}": keyword for output_num, keyword in enumerate(self.keywords)}
+
+    def get_output_tags(self, selected_route) -> list[str]:
+        if self.tag_output_message:
+            return [f"{self.name}:{selected_route}"]
+        return []
 
 
-class RouterNode(RouterMixin, Passthrough, HistoryMixin):
+class RouterNode(RouterMixin, PipelineRouterNode, HistoryMixin):
     """Routes the input to one of the linked nodes using an LLM"""
 
     model_config = ConfigDict(
         json_schema_extra=NodeSchema(
             label="LLM Router",
             documentation_link=settings.DOCUMENTATION_LINKS["node_llm_router"],
-            field_order=["llm_provider_id", "llm_temperature", "history_type", "prompt", "keywords"],
+            field_order=[
+                "llm_provider_id",
+                "llm_temperature",
+                "history_type",
+                "prompt",
+                "keywords",
+                "tag_output_message",
+            ],
         )
     )
-
     prompt: str = Field(
         default="You are an extremely helpful router",
         min_length=1,
         json_schema_extra=UiSchema(widget=Widgets.expandable_text),
     )
 
+    @model_validator(mode="after")
+    def check_prompt_variables(self) -> Self:
+        context = {
+            "prompt": self.prompt,
+        }
+        try:
+            validate_prompt_variables(
+                context=context, prompt_key="prompt", known_vars=set([PromptVars.PARTICIPANT_DATA])
+            )
+            return self
+        except ValidationError as e:
+            raise PydanticCustomError(
+                "invalid_prompt", e.error_dict["prompt"][0].message, {"field": "prompt"}
+            ) from None
+
     def _process_conditional(self, state: PipelineState, node_id=None):
-        from apps.service_providers.llm_service.prompt_context import PromptTemplateContext
-
+        default_keyword = self.keywords[self.default_keyword_index] if self.keywords else None
         prompt = OcsPromptTemplate.from_messages(
-            [("system", self.prompt), MessagesPlaceholder("history", optional=True), ("human", "{input}")]
+            [
+                ("system", f"{self.prompt}\nThe default routing destination is: {default_keyword}"),
+                MessagesPlaceholder("history", optional=True),
+                ("human", "{input}"),
+            ]
         )
-
         session: ExperimentSession = state["experiment_session"]
         node_input = state["messages"][-1]
+
         context = {"input": node_input}
         context.update(PromptTemplateContext(session).get_context(prompt.input_variables))
 
@@ -470,16 +519,23 @@ class RouterNode(RouterMixin, Passthrough, HistoryMixin):
             input_messages = prompt.format_messages(**context)
             context["history"] = self._get_history(session, node_id, input_messages)
 
-        chain = prompt | self.get_chat_model()
+        llm = self.get_chat_model()
+        router_schema = self._create_router_schema()
+        chain = prompt | llm.with_structured_output(router_schema)
+        try:
+            result = chain.invoke(context, config=self._config)
+            keyword = getattr(result, "route", None)
+        except PydanticValidationError:
+            keyword = None
+        if not keyword:
+            keyword = self.keywords[self.default_keyword_index]
 
-        result = chain.invoke(context, config=self._config)
-        keyword = self._get_keyword(result.content)
         if session:
             self._save_history(session, node_id, node_input, keyword)
         return keyword
 
 
-class StaticRouterNode(RouterMixin, Passthrough):
+class StaticRouterNode(RouterMixin, PipelineRouterNode):
     """Routes the input to a linked node using the temp state of the pipeline or participant data"""
 
     class DataSource(TextChoices):
@@ -519,7 +575,11 @@ class StaticRouterNode(RouterMixin, Passthrough):
         except KeyError:
             result = ""
 
-        return self._get_keyword(result)
+        result_lower = result.lower()
+        for keyword in self.keywords:
+            if keyword.lower() == result_lower:
+                return keyword
+        return self.keywords[self.default_keyword_index]
 
 
 class ExtractStructuredDataNodeMixin:
@@ -539,19 +599,20 @@ class ExtractStructuredDataNodeMixin:
             | prompt
         )
 
-    def extraction_chain(self, json_schema, reference_data):
-        return self._prompt_chain(reference_data) | super().get_chat_model().with_structured_output(json_schema)
+    def extraction_chain(self, tool_class, reference_data):
+        return self._prompt_chain(reference_data) | super().get_chat_model().with_structured_output(tool_class)
 
     def _process(self, input, state: PipelineState, node_id: str, **kwargs) -> PipelineState:
-        json_schema = self.to_json_schema(json.loads(self.data_schema))
+        ToolClass = self.get_tool_class(json.loads(self.data_schema))
         reference_data = self.get_reference_data(state)
-        prompt_token_count = self._get_prompt_token_count(reference_data, json_schema)
+        prompt_token_count = self._get_prompt_token_count(reference_data, ToolClass.model_json_schema())
         message_chunks = self.chunk_messages(input, prompt_token_count=prompt_token_count)
 
         new_reference_data = reference_data
         for idx, message_chunk in enumerate(message_chunks, start=1):
-            chain = self.extraction_chain(json_schema=json_schema, reference_data=new_reference_data)
+            chain = self.extraction_chain(tool_class=ToolClass, reference_data=new_reference_data)
             output = chain.invoke(message_chunk, config=self._config)
+            output = output.model_dump()
             self.logger.info(
                 f"Chunk {idx}",
                 input=f"\nReference data:\n{new_reference_data}\nChunk data:\n{message_chunk}\n\n",
@@ -612,7 +673,7 @@ class ExtractStructuredDataNodeMixin:
 
         return text_splitter.split_text(input)
 
-    def to_json_schema(self, data: dict):
+    def get_tool_class(self, data: dict):
         """Converts a dictionary to a JSON schema by first converting it to a Pydantic object and dumping it again.
         The input should be in the format {"key": "description", "key2": [{"key": "description"}]}
 
@@ -637,10 +698,8 @@ class ExtractStructuredDataNodeMixin:
             return create_model(model_name, **pydantic_schema)
 
         Model = _create_model_from_data(data, "CustomModel")
-        schema = Model.model_json_schema()
-        # The schema needs a description in order to comply with function calling APIs
-        schema["description"] = ""
-        return schema
+        Model.description = ""
+        return Model
 
 
 class StructuredDataSchemaValidatorMixin:
@@ -648,8 +707,8 @@ class StructuredDataSchemaValidatorMixin:
     def validate_data_schema(cls, value):
         try:
             parsed_value = json.loads(value)
-        except json.JSONDecodeError:
-            raise PydanticCustomError("invalid_schema", "Invalid schema")
+        except json.JSONDecodeError as e:
+            raise PydanticCustomError("invalid_schema", "Invalid schema") from e
 
         if not isinstance(parsed_value, dict) or len(parsed_value) == 0:
             raise PydanticCustomError("invalid_schema", "Invalid schema")
@@ -787,7 +846,7 @@ class AssistantNode(PipelineNode):
         try:
             assistant = OpenAiAssistant.objects.get(id=self.assistant_id)
         except OpenAiAssistant.DoesNotExist:
-            raise PipelineNodeBuildError(f"Assistant {self.assistant_id} does not exist")
+            raise PipelineNodeBuildError(f"Assistant {self.assistant_id} does not exist") from None
 
         session: ExperimentSession | None = state.get("experiment_session")
         runnable = self._get_assistant_runnable(assistant, session=session, node_id=node_id)
@@ -861,12 +920,12 @@ class CodeNode(PipelineNode):
             try:
                 exec(byte_code, {}, custom_locals)
             except Exception as exc:
-                raise PydanticCustomError("invalid_code", "{error}", {"error": str(exc)})
+                raise PydanticCustomError("invalid_code", "{error}", {"error": str(exc)}) from exc
 
             try:
                 main = custom_locals["main"]
             except KeyError:
-                raise SyntaxError("You must define a 'main' function")
+                raise SyntaxError("You must define a 'main' function") from None
 
             for name, item in custom_locals.items():
                 if name != "main" and inspect.isfunction(item):
@@ -879,7 +938,7 @@ class CodeNode(PipelineNode):
                 raise SyntaxError("The main function should have the signature main(input, **kwargs) only.")
 
         except SyntaxError as exc:
-            raise PydanticCustomError("invalid_code", "{error}", {"error": exc.msg})
+            raise PydanticCustomError("invalid_code", "{error}", {"error": exc.msg}) from None
         return value
 
     def _process(self, input: str, state: PipelineState, node_id: str) -> PipelineState:

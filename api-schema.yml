@@ -349,6 +349,34 @@ paths:
       responses:
         '200':
           description: No response body
+  /api/sessions/{id}/update_state/:
+    patch:
+      operationId: session_update_state
+      summary: Update Experiment Session State
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+        description: ID of the session
+        required: true
+      tags:
+      - Experiment Sessions
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Patchedupdate_state_serializer'
+      security:
+      - apiKeyAuth: []
+      - tokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/update_state_response'
+          description: ''
   /api/trigger_bot:
     post:
       operationId: trigger_bot_message
@@ -433,7 +461,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/NewAPIMessage'
+              $ref: '#/components/schemas/ApiMessage'
         required: true
       security:
       - apiKeyAuth: []
@@ -443,7 +471,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/NewAPIMessageResponse'
+                $ref: '#/components/schemas/ApiResponseMessage'
           description: ''
   /channels/api/{experiment_id}/v{version}/incoming_message:
     post:
@@ -472,7 +500,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/NewAPIMessage'
+              $ref: '#/components/schemas/ApiMessage'
         required: true
       security:
       - apiKeyAuth: []
@@ -482,10 +510,45 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/NewAPIMessageResponse'
+                $ref: '#/components/schemas/ApiResponseMessage'
           description: ''
 components:
   schemas:
+    ApiMessage:
+      type: object
+      properties:
+        message:
+          type: string
+          title: User message
+        session:
+          type: string
+          title: Optional session ID
+      required:
+      - message
+    ApiResponseAttachment:
+      type: object
+      properties:
+        file_name:
+          type: string
+        link:
+          type: string
+      required:
+      - file_name
+      - link
+    ApiResponseMessage:
+      type: object
+      properties:
+        response:
+          type: string
+          title: AI response
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiResponseAttachment'
+          title: List of file URLs
+      required:
+      - attachments
+      - response
     ChatCompletionResponseChoices:
       type: object
       properties:
@@ -623,6 +686,9 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Message'
+        state:
+          type: object
+          additionalProperties: {}
       required:
       - experiment
       - url
@@ -737,25 +803,6 @@ components:
         * `system` - system
         * `user` - user
         * `assistant` - assistant
-    NewAPIMessage:
-      type: object
-      properties:
-        message:
-          type: string
-          title: User message
-        session:
-          type: string
-          title: Optional session ID
-      required:
-      - message
-    NewAPIMessageResponse:
-      type: object
-      properties:
-        response:
-          type: string
-          title: AI response
-      required:
-      - response
     ObjectEnum:
       enum:
       - chat.completion
@@ -864,6 +911,12 @@ components:
           type: boolean
           default: false
           title: Delete Schedule
+    Patchedupdate_state_serializer:
+      type: object
+      properties:
+        state:
+          type: object
+          additionalProperties: {}
     PlatformEnum:
       enum:
       - telegram
@@ -923,6 +976,17 @@ components:
       - identifier
       - platform
       - prompt_text
+    update_state_response:
+      type: object
+      properties:
+        success:
+          type: boolean
+        state:
+          type: object
+          additionalProperties: {}
+      required:
+      - state
+      - success
   securitySchemes:
     apiKeyAuth:
       type: apiKey

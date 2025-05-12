@@ -1,5 +1,4 @@
 import logging
-from typing import Self
 
 from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import ValidationError
@@ -15,7 +14,7 @@ from apps.custom_actions.schema_utils import (
     get_operations_from_spec_dict,
     get_standalone_schema_for_action_operation,
 )
-from apps.experiments.models import VersionsMixin, VersionsObjectManagerMixin
+from apps.experiments.versioning import VersionDetails, VersionField, VersionsMixin, VersionsObjectManagerMixin
 from apps.service_providers.auth_service import anonymous_auth_service
 from apps.teams.models import BaseTeamModel
 from apps.utils.models import BaseModel
@@ -56,7 +55,7 @@ class CustomAction(BaseTeamModel):
         try:
             self.operations = get_operations_from_spec_dict(self.api_schema)
         except Exception as e:
-            raise ValidationError(f"Invalid OpenAPI schema: {e}")
+            raise ValidationError(f"Invalid OpenAPI schema: {e}") from e
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -156,25 +155,26 @@ class CustomActionOperation(BaseModel, VersionsMixin):
         return make_model_id(holder_id, self.custom_action_id, self.operation_id)
 
     @transaction.atomic()
-    def create_new_version(self, new_experiment=None, new_assistant=None, new_node=None):
+    def create_new_version(self, new_experiment=None, new_assistant=None, new_node=None, is_copy=False):
         action_holders = [new_experiment, new_assistant, new_node]
         if not action_holders:
             raise ValueError("Either new_experiment or new_assistant must be provided")
         if len([holder for holder in action_holders if holder is not None]) > 1:
             raise ValueError("Only one of new_experiment or new_assistant can be provided")
-        new_instance = super().create_new_version(save=False)
+        new_instance = super().create_new_version(save=False, is_copy=is_copy)
         new_instance.experiment = new_experiment
         new_instance.assistant = new_assistant
         new_instance.node = new_node
-        new_instance.operation_schema = get_standalone_schema_for_action_operation(new_instance)
+        if not is_copy:
+            new_instance.operation_schema = get_standalone_schema_for_action_operation(new_instance)
         new_instance.save()
         return new_instance
 
-    def get_fields_to_exclude(self):
-        return super().get_fields_to_exclude() + ["experiment", "assistant", "_operation_schema"]
-
-    def compare_with_model(self, new: Self, exclude_fields: list[str], early_abort=False) -> set:
-        changes = super().compare_with_model(new, exclude_fields, early_abort=early_abort)
-        if self.operation_schema != new.operation_schema:
-            changes.add("operation_schema")
-        return changes
+    @property
+    def version_details(self) -> VersionDetails:
+        return VersionDetails(
+            instance=self,
+            fields=[
+                VersionField(name="operation_schema", raw_value=self.operation_schema),
+            ],
+        )

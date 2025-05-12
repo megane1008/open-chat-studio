@@ -1,4 +1,4 @@
-import React, {ChangeEvent, useState} from "react";
+import React, {ChangeEvent, useState, useRef} from "react";
 import Pipeline from "./Pipeline";
 import usePipelineStore from "./stores/pipelineStore";
 
@@ -18,10 +18,19 @@ export default function Page() {
     setName(event.target.value);
     updatePipelineName(event.target.value);
   };
+  const originalName = useRef(currentPipeline?.name);
+  const isNameEdited = name !== originalName.current;
+  const origin = JSON.parse(document.getElementById("pipeline-request-origin")?.textContent || '""');
+  const readOnly = JSON.parse(document.getElementById("read-only")?.textContent || "false");
+
   const onClickSave = () => {
     if (currentPipeline) {
-      const updatedPipeline = {...currentPipeline, data: {nodes, edges}}
-      savePipeline(updatedPipeline).then(() => setEditingName(false));
+    const updatedPipeline = {
+      ...currentPipeline,
+      data: { nodes, edges },
+      ...(isNameEdited && origin === "chatbots" && { experiment_name: name })
+    };
+    savePipeline(updatedPipeline).then(() => setEditingName(false));
     }
   };
   return (
@@ -35,7 +44,7 @@ export default function Page() {
                   type="text"
                   value={name}
                   onChange={handleNameChange}
-                  className="input input-bordered input-sm"
+                  className="input input-sm"
                   placeholder="Edit pipeline name"
                 />
                 <button className="btn btn-sm btn-primary" onClick={onClickSave}>
@@ -45,9 +54,11 @@ export default function Page() {
             ) : (
               <>
                 <div className="text-lg font-bold">{name}</div>
-                <button className="btn btn-sm btn-ghost" onClick={() => setEditingName(true)}>
-                  <i className="fa fa-pencil"></i>
-                </button>
+                {!readOnly && 
+                  <button className="btn btn-sm btn-ghost" onClick={() => setEditingName(true)}>
+                    <i className="fa fa-pencil"></i>
+                  </button>
+                }
               </>
             )}
             <div className="tooltip tooltip-right" data-tip={dirty ? (isSaving ? "Saving ..." : "Preparing to Save") : "Saved"}>
@@ -63,6 +74,11 @@ export default function Page() {
               <div className="content-center">
                 <i className="fa fa-exclamation-triangle text-red-500 mr-2"></i>
                 <small className="text-red-500">{error}</small>
+              </div>
+            )}
+            {readOnly &&  (
+              <div className="content-center">
+                <small>(Read-only)</small>
               </div>
             )}
           </div>

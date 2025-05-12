@@ -9,14 +9,15 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import models, transaction
 from django.db.models import F, Func, OuterRef, Q, Subquery, functions
 from django.utils import timezone
+from pytz.exceptions import UnknownTimeZoneError
 
 from apps.chat.models import ChatMessage, ChatMessageType
 from apps.events import actions
 from apps.events.const import TOTAL_FAILURES
-from apps.experiments.models import Experiment, ExperimentSession, VersionsMixin, VersionsObjectManagerMixin
-from apps.experiments.versioning import VersionDetails, VersionField
+from apps.experiments.models import Experiment, ExperimentSession
+from apps.experiments.versioning import VersionDetails, VersionField, VersionsMixin, VersionsObjectManagerMixin
+from apps.service_providers.tracing import TraceInfo
 from apps.teams.models import BaseTeamModel
-from apps.teams.utils import current_team
 from apps.utils.models import BaseModel
 from apps.utils.slug import get_next_unique_id
 from apps.utils.time import pretty_date
@@ -34,11 +35,19 @@ ACTION_HANDLERS = {
 
 
 class StaticTriggerObjectManager(VersionsObjectManagerMixin, models.Manager):
-    pass
+    def published_versions(self):
+        return self.filter(experiment__is_default_version=True)
+
+    def get_published_version(self, trigger):
+        return self.published_versions().get(working_version_id=trigger.get_working_version_id())
 
 
 class TimeoutTriggerObjectManager(VersionsObjectManagerMixin, models.Manager):
-    pass
+    def published_versions(self):
+        return self.filter(experiment__is_default_version=True)
+
+    def get_published_version(self, trigger):
+        return self.published_versions().get(working_version_id=trigger.get_working_version_id())
 
 
 class EventActionType(models.TextChoices):
@@ -120,13 +129,15 @@ class StaticTrigger(BaseModel, VersionsMixin):
         return "StaticTrigger"
 
     def fire(self, session):
+        working_version = self.get_working_version()
         try:
             result = ACTION_HANDLERS[self.action.action_type]().invoke(session, self.action)
-            self.event_logs.create(session=session, status=EventLogStatusChoices.SUCCESS, log=result)
+            working_version.event_logs.create(session=session, status=EventLogStatusChoices.SUCCESS, log=result)
             return result
         except Exception as e:
             logging.exception(e)
-            self.event_logs.create(session=session, status=EventLogStatusChoices.FAILURE, log=str(e))
+            working_version.event_logs.create(session=session, status=EventLogStatusChoices.FAILURE, log=str(e))
+        return None
 
     @transaction.atomic()
     def delete(self, *args, **kwargs):
@@ -135,11 +146,11 @@ class StaticTrigger(BaseModel, VersionsMixin):
         return result
 
     @transaction.atomic()
-    def create_new_version(self, new_experiment: Experiment):
+    def create_new_version(self, new_experiment: Experiment, is_copy: bool = False):
         """Create a duplicate and assign the `new_experiment` to it. Also duplicate all EventActions"""
-        new_instance = super().create_new_version(save=False)
+        new_instance = super().create_new_version(save=False, is_copy=is_copy)
         new_instance.experiment = new_experiment
-        new_instance.action = new_instance.action.create_new_version()
+        new_instance.action = new_instance.action.create_new_version(is_copy=is_copy)
         new_instance.save()
         return new_instance
 
@@ -182,11 +193,11 @@ class TimeoutTrigger(BaseModel, VersionsMixin):
     objects = TimeoutTriggerObjectManager()
 
     @transaction.atomic()
-    def create_new_version(self, new_experiment: Experiment):
+    def create_new_version(self, new_experiment: Experiment, is_copy: bool = False):
         """Create a duplicate and assign the `new_experiment` to it. Also duplicate all EventActions"""
-        new_instance = super().create_new_version(save=False)
+        new_instance = super().create_new_version(save=False, is_copy=is_copy)
         new_instance.experiment = new_experiment
-        new_instance.action = new_instance.action.create_new_version()
+        new_instance.action = new_instance.action.create_new_version(is_copy=is_copy)
         new_instance.save()
         return new_instance
 
@@ -242,7 +253,7 @@ class TimeoutTrigger(BaseModel, VersionsMixin):
 
         sessions = (
             ExperimentSession.objects.filter(
-                experiment=self.experiment,
+                experiment=self.experiment.get_working_version(),
                 ended_at=None,
             )
             .exclude(status__in=STATUSES_FOR_COMPLETE_CHATS)
@@ -252,6 +263,8 @@ class TimeoutTrigger(BaseModel, VersionsMixin):
                 failure_count=Subquery(failure_count_for_last_message),
             )
             .filter(
+                last_human_message_created_at__gte=self.updated_at,
+                # last message received after trigger config was updated
                 last_human_message_created_at__lt=trigger_time,
                 last_human_message_created_at__isnull=False,
             )  # The last message was received before the trigger time
@@ -273,26 +286,27 @@ class TimeoutTrigger(BaseModel, VersionsMixin):
 
         result = None
 
+        working_version = self.get_working_version()
         try:
             result = ACTION_HANDLERS[self.action.action_type]().invoke(session, self.action)
-            self.event_logs.create(
+            working_version.event_logs.create(
                 session=session, chat_message=last_human_message, status=EventLogStatusChoices.SUCCESS, log=result
             )
         except Exception as e:
-            self.event_logs.create(
+            working_version.event_logs.create(
                 session=session, chat_message=last_human_message, status=EventLogStatusChoices.FAILURE, log=str(e)
             )
 
-        if not self._has_triggers_left(session, last_human_message):
+        if not self._has_triggers_left(working_version, session, last_human_message):
             from apps.events.tasks import enqueue_static_triggers
 
             enqueue_static_triggers.delay(session.id, StaticTriggerType.LAST_TIMEOUT)
 
         return result
 
-    def _has_triggers_left(self, session, message):
+    def _has_triggers_left(self, working_version, session, message):
         has_succeeded = (
-            self.event_logs.filter(
+            working_version.event_logs.filter(
                 session=session,
                 chat_message=message,
                 status=EventLogStatusChoices.SUCCESS,
@@ -300,7 +314,7 @@ class TimeoutTrigger(BaseModel, VersionsMixin):
             >= self.total_num_triggers
         )
         failed = (
-            self.event_logs.filter(
+            working_version.event_logs.filter(
                 session=session,
                 chat_message=message,
                 status=EventLogStatusChoices.FAILURE,
@@ -414,12 +428,19 @@ class ScheduledMessage(BaseTeamModel):
             # Schedules probably created by the API
             return
 
-        with current_team(experiment_session.team):
-            experiment_session.ad_hoc_bot_message(
-                self.params["prompt_text"],
-                fail_silently=False,
-                use_experiment=self._get_experiment_to_generate_response(),
-            )
+        trace_info = TraceInfo(
+            name="scheduled message",
+            metadata={
+                "schedule_id": self.external_id,
+                "trigger_number": self.total_triggers,
+            },
+        )
+        experiment_session.ad_hoc_bot_message(
+            self.params["prompt_text"],
+            trace_info,
+            fail_silently=False,
+            use_experiment=self._get_experiment_to_generate_response(),
+        )
 
         utc_now = timezone.now()
         self.last_triggered_at = utc_now
@@ -456,7 +477,36 @@ class ScheduledMessage(BaseTeamModel):
 
     @cached_property
     def params(self):
-        return self.custom_schedule_params or (self.action.params if self.action else {})
+        if self.custom_schedule_params:
+            return self.custom_schedule_params
+
+        if not self.action:
+            return {}
+
+        # use the latest version of the params
+        return self.published_action.params
+
+    @cached_property
+    def published_action(self):
+        """The action associated with the published version of the trigger that created this message"""
+        if not self.action:
+            return None
+
+        try:
+            trigger = self.action.static_trigger
+            trigger = StaticTrigger.objects.get_published_version(trigger)
+            return trigger.action
+        except StaticTrigger.DoesNotExist:
+            pass
+
+        try:
+            trigger = self.action.timeout_trigger
+            trigger = TimeoutTrigger.objects.get_published_version(trigger)
+            return trigger.action
+        except TimeoutTrigger.DoesNotExist:
+            pass
+
+        return self.action
 
     @property
     def name(self) -> str:
@@ -519,13 +569,18 @@ class ScheduledMessage(BaseTeamModel):
     def __str__(self):
         return self.as_string()
 
-    def as_dict(self, as_timezone=None):
+    def as_dict(self, as_timezone: str = None):
         next_trigger_date = self.next_trigger_date
         last_triggered_at = self.last_triggered_at
         if as_timezone:
-            next_trigger_date = next_trigger_date.astimezone(pytz.timezone(as_timezone))
-            if last_triggered_at:
-                last_triggered_at = last_triggered_at.astimezone(pytz.timezone(as_timezone))
+            try:
+                pytz_timezone = pytz.timezone(as_timezone)
+            except UnknownTimeZoneError:
+                pass
+            else:
+                next_trigger_date = next_trigger_date.astimezone(pytz_timezone)
+                if last_triggered_at:
+                    last_triggered_at = last_triggered_at.astimezone(pytz_timezone)
         return {
             "name": self.name,
             "prompt": self.prompt_text,

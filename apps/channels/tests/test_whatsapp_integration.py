@@ -10,9 +10,12 @@ from django.urls import reverse
 from apps.channels.datamodels import TurnWhatsappMessage, TwilioMessage
 from apps.channels.models import ChannelPlatform
 from apps.channels.tasks import handle_turn_message, handle_twilio_message
-from apps.chat.channels import MESSAGE_TYPES
+from apps.chat.channels import MESSAGE_TYPES, WhatsappChannel
+from apps.chat.models import ChatMessage
 from apps.service_providers.speech_service import SynthesizedAudio
 from apps.utils.factories.channels import ExperimentChannelFactory
+from apps.utils.factories.experiment import ExperimentSessionFactory
+from apps.utils.factories.files import FileFactory
 
 from .message_examples import turnio_messages, twilio_messages
 
@@ -77,10 +80,11 @@ class TestTwilio:
     ):
         """Test that the twilio integration can use the WhatsappChannel implementation"""
         synthesize_voice_mock.return_value = SynthesizedAudio(audio=BytesIO(b"123"), duration=10, format="mp3")
-        with patch("apps.service_providers.messaging_service.TwilioService.s3_client"), patch(
-            "apps.service_providers.messaging_service.TwilioService.client"
+        with (
+            patch("apps.service_providers.messaging_service.TwilioService.s3_client"),
+            patch("apps.service_providers.messaging_service.TwilioService.client"),
         ):
-            get_llm_response_mock.return_value = "Hi"
+            get_llm_response_mock.return_value = ChatMessage(content="Hi")
             get_voice_transcript_mock.return_value = "Hi"
 
             handle_twilio_message(message_data=incoming_message, request_uri="", signature="")
@@ -89,6 +93,32 @@ class TestTwilio:
                 send_text_message.assert_called()
             elif message_type == "audio":
                 send_voice_message.assert_called()
+
+    @pytest.mark.django_db()
+    @patch("apps.service_providers.messaging_service.TwilioService.client")
+    def test_attachments_are_sent_as_separate_messages(self, twilio_client_mock, experiment, twilio_provider):
+        """
+        Test that the bot's response is sent along with a message for each supported attachment
+        """
+        channel = ExperimentChannelFactory(
+            platform=ChannelPlatform.WHATSAPP, messaging_provider=twilio_provider, extra_data={"number": "123"}
+        )
+        session = ExperimentSessionFactory(experiment_channel=channel, experiment=experiment)
+        channel = WhatsappChannel.from_experiment_session(session)
+        file1 = FileFactory(name="f1", content_type="image/jpeg")
+        file2 = FileFactory(name="f2", content_type="image/jpeg")
+
+        channel.send_message_to_user("Hi there", [file1, file2])
+        message_call = twilio_client_mock.messages.create.mock_calls[0]
+        attachment_call_1 = twilio_client_mock.messages.create.mock_calls[1]
+        attachment_call_2 = twilio_client_mock.messages.create.mock_calls[2]
+
+        assert message_call.kwargs["body"] == "Hi there"
+        assert attachment_call_1.kwargs["body"] == file1.name
+        assert attachment_call_1.kwargs["media_url"] == file1.download_link(session.id)
+
+        assert attachment_call_2.kwargs["body"] == file2.name
+        assert attachment_call_2.kwargs["media_url"] == file2.download_link(session.id)
 
 
 class TestTurnio:
@@ -130,7 +160,7 @@ class TestTurnio:
     ):
         """Test that the turnio integration can use the WhatsappChannel implementation"""
         synthesize_voice_mock.return_value = SynthesizedAudio(audio=BytesIO(b"123"), duration=10, format="mp3")
-        _get_bot_response.return_value = "Hi"
+        _get_bot_response.return_value = ChatMessage(content="Hi")
         get_voice_transcript_mock.return_value = "Hi"
         handle_turn_message(experiment_id=turnio_whatsapp_channel.experiment.public_id, message_data=incoming_message)
         if message_type == "text":
@@ -157,5 +187,25 @@ class TestTurnio:
     def test_outbound_and_status_messages_ignored(self, handle_turn_message_task, message, client):
         url = reverse("channels:new_turn_message", kwargs={"experiment_id": str(uuid4())})
         response = client.post(url, data=message, content_type="application/json")
-        response.status_code == 200
+        assert response.status_code == 200
         handle_turn_message_task.assert_not_called()
+
+    @pytest.mark.django_db()
+    @patch("apps.service_providers.messaging_service.TurnIOService.client")
+    def test_attachment_links_attached_to_message(self, turnio_client, turnio_whatsapp_channel, experiment):
+        session = ExperimentSessionFactory(experiment_channel=turnio_whatsapp_channel, experiment=experiment)
+        channel = WhatsappChannel.from_experiment_session(session)
+        files = FileFactory.create_batch(2)
+        channel.send_message_to_user("Hi there", files=files)
+        call_args = turnio_client.messages.send_text.mock_calls[0].args
+        final_message = call_args[1]
+
+        expected_final_message = f"""Hi there
+
+{files[0].name}
+{files[0].download_link(session.id)}
+
+{files[1].name}
+{files[1].download_link(session.id)}
+"""
+        assert final_message == expected_final_message

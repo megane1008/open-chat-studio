@@ -2,7 +2,6 @@ from typing import Any, Self
 
 from django.utils import timezone
 
-from apps.channels.models import ChannelPlatform
 from apps.experiments.models import ParticipantData
 from apps.utils.time import pretty_date
 
@@ -48,8 +47,8 @@ class PromptTemplateContext:
     def get_media_summaries(self):
         """
         Example output:
-        * File (27): summary1
-        * File (28): summary2
+        * File (id=27, content_type=image/png): summary1
+        * File (id=28, content_type=application/pdf): summary2
         """
         from apps.documents.models import Collection
 
@@ -66,25 +65,13 @@ class PromptTemplateContext:
             return ""
 
     def get_participant_data(self):
-        if self.is_unauthorized_participant:
-            data = ""
-        else:
-            data = self.participant_data_proxy.get() or ""
+        data = self.participant_data_proxy.get() or {}
+        if scheduled_messages := self.participant_data_proxy.get_schedules():
+            data = {**data, "scheduled_messages": scheduled_messages}
         return SafeAccessWrapper(data)
 
     def get_current_datetime(self):
         return pretty_date(timezone.now(), self.participant_data_proxy.get_timezone())
-
-    @property
-    def is_unauthorized_participant(self):
-        """Returns `true` if a participant is unauthorized. A participant is considered authorized when the
-        following conditions are met:
-        For web channels:
-        - They are a platform user
-        All other channels:
-        - Always True, since the external channel handles authorization
-        """
-        return self.session.experiment_channel.platform == ChannelPlatform.WEB and self.session.participant.user is None
 
 
 class SafeAccessWrapper(dict):
@@ -168,6 +155,7 @@ class ParticipantDataProxy:
 
     def __init__(self, experiment_session):
         self.session = experiment_session
+        self.experiment = self.session.experiment if self.session else None
         self._participant_data = None
         self._scheduled_messages = None
 
@@ -203,23 +191,9 @@ class ParticipantDataProxy:
         Returns all active scheduled messages for the participant in the current experiment session.
         """
         if self._scheduled_messages is None:
-            from apps.events.models import ScheduledMessage
-
-            experiment = self.session.experiment_id
-            participant = self.session.participant_id
-            team = self.session.experiment.team
-            messages = (
-                ScheduledMessage.objects.filter(
-                    experiment_id=experiment,
-                    participant_id=participant,
-                    team=team,
-                    is_complete=False,
-                    cancelled_at=None,
-                )
-                .select_related("action")
-                .order_by("created_at")
+            self._scheduled_messages = self.session.participant.get_schedules_for_experiment(
+                self.experiment, as_dict=True, as_timezone=self.get_timezone()
             )
-            self._scheduled_messages = [message.as_dict() for message in messages]
         return self._scheduled_messages
 
     def get_timezone(self):
